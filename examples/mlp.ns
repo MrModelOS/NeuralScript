@@ -1,0 +1,57 @@
+// NeuralScript example: MLP classifier with compile-time shape verification.
+//
+// Build & inspect:
+//   ./build/nsc examples/mlp.ns --check     # static shape verification only
+//   ./build/nsc examples/mlp.ns --mlir      # dump MLIR lowering
+//   ./build/nsc examples/mlp.ns --cuda      # generate CUDA backend
+//   ./build/nsc examples/mlp.ns --cpp       # generate CPU reference backend
+
+// ---- Type aliases: symbolic + constant dimensions ----
+type Batch    = Dynamic     // symbolic batch dim, resolved at runtime entry
+type Features = 784         // constant
+type Classes  = 10          // constant
+
+// ---- Model definition: pipeline operator (->) composition ----
+network MLPClassifier {
+    input:  Tensor[Batch, Features] float32
+    output: Tensor[Batch, Classes] float32
+
+    layer fc1  = Dense(in: Features, out: 512, activation: ReLU)
+    layer drop = Dropout(rate: 0.1)
+    layer fc2  = Dense(in: 512, out: Classes, activation: Identity)
+
+    forward(x) {
+        return x -> fc1 -> drop -> fc2
+    }
+}
+
+// ---- Training step: grad-block isolates the backward graph ----
+fn train_step(batch_x: Tensor[Batch, 784],
+              batch_y: Tensor[Batch, 10]) -> float32 {
+    var w1: Tensor[784, 512] float32
+    var w2: Tensor[512, 10] float32
+
+    grad {
+        // Backward graph is isolated here: intermediates become
+        // eligible for immediate free (liveness) or activation recompute.
+        var hidden = batch_x @ w1
+        var preds  = hidden @ w2
+        var loss   = cross_entropy(preds, batch_y)
+    }
+
+    return 0.0
+}
+
+// ---- Inference path: forward only ----
+fn infer(x: Tensor[Batch, 784]) -> Tensor[Batch, 10] {
+    var w1: Tensor[784, 512] float32
+    var w2: Tensor[512, 10] float32
+    return x @ w1 @ w2
+}
+
+// Compile-time checks performed here:
+//   [Batch, 784] @ [784, 512] -> [Batch, 512]   (inner 784 == 784)   OK
+//   [Batch, 512] @ [512, 10]  -> [Batch, 10]    (inner 512 == 512)   OK
+//
+// Any shape mismatch in '@' aborts the build with an exact diagnostic
+// before any runtime code is produced.
