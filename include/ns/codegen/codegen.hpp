@@ -6,6 +6,15 @@
 
 namespace ns {
 
+// CUDA target layer (src/codegen/cuda_backend.cpp): device kernel sources and
+// launch/runtime snippets owned by the target, spliced by CodeGenerator::gen_cuda.
+namespace cuda {
+    std::string device_helpers_source();   // launcher macros + scalar act helpers
+    std::string forward_kernels_source();  // tiled GEMM, act, copy, fill, binop, ln, softmax
+    std::string train_kernels_source();    // grad + AdamW/Muon/orthonom kernels
+    std::string runtime_utils_source();    // canonical buffers + ns_cu_reserve
+} // namespace cuda
+
 enum class TargetBackend {
     CPU_CXX,     // Generic C++ (scalar reference)
     CPU_SIMD,    // C++ with AVX-512 intrinsics (placeholder)
@@ -30,6 +39,16 @@ public:
 private:
     std::string gen_cuda(const MLIRModule& module, const CodegenOptions& opts);
     std::string gen_cpu(const MLIRModule& module, const CodegenOptions& opts);
+
+    // Emit the AOT training core (forward + backward + optimizer step) as a
+    // C-ABI slave of ns_runtime_train_step / ns_objective_loss.
+    std::string emit_train_core(const MLIRFunction& tfn, int64_t in_cols);
+
+    // CUDA twin of emit_train_core: the same reverse-mode step, but every
+    // operation becomes a device-kernel launch over persistent device buffers
+    // (weights stay resident in video memory; only the batch input and the
+    // loss scalar cross PCIe per step).
+    std::string emit_train_core_cuda(const MLIRFunction& tfn, int64_t in_cols, int64_t out_cols);
 
     // Kernel emission helpers
     std::string emit_gemm_kernel(const std::string& a, const std::string& b,

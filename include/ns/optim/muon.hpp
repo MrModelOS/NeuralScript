@@ -1,4 +1,5 @@
 #pragma once
+#include "ns/optim/optim_params.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -50,11 +51,11 @@ public:
 
 struct MuonParams {
     double lr = 0.02;              // base learning rate
-    double weight_decay = 0.01;
-    double muon_momentum = 0.95;   // momentum applied to the matrix gradient
-    double adam_beta1 = 0.9;
-    double adam_beta2 = 0.999;
-    double adam_eps = 1e-8;
+    double weight_decay = optim::kMuonDecay;
+    double muon_momentum = optim::kMuonMomentum;
+    double adam_beta1 = optim::kAdamWBeta1;
+    double adam_beta2 = optim::kAdamWBeta2;
+    double adam_eps = optim::kAdamWEps;
 };
 
 struct MuonState {

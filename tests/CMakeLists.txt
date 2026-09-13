@@ -24,9 +24,6 @@ target_link_libraries(test_codegen_cpu ns_core)
 add_test(NAME test_codegen_cpu COMMAND test_codegen_cpu)
 set_tests_properties(test_codegen_cpu PROPERTIES TIMEOUT 120)
 
-add_executable(test_autodiff test_autodiff.cpp)
-add_test(NAME test_autodiff COMMAND test_autodiff)
-
 add_executable(test_fusion test_fusion.cpp)
 target_link_libraries(test_fusion ns_core)
 add_test(NAME test_fusion COMMAND test_fusion)
@@ -46,3 +43,39 @@ add_executable(test_train test_train.cpp)
 target_link_libraries(test_train ns_core)
 add_test(NAME test_train COMMAND test_train)
 set_tests_properties(test_train PROPERTIES TIMEOUT 120)
+
+add_executable(test_aot_train test_aot_train.cpp)
+target_link_libraries(test_aot_train ns_core)
+target_compile_definitions(test_aot_train PRIVATE
+    NS_REPO_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../include")
+add_test(NAME test_aot_train COMMAND test_aot_train)
+set_tests_properties(test_aot_train PROPERTIES TIMEOUT 120)
+
+# CUDA backend integration is opt-in: adding it unconditionally would make
+# ctest FAIL/hang on machines without the CUDA toolkit or a device. With
+# -DNS_ENABLE_CUDA=ON the test compiles the emitted .cu with nvcc (if present)
+# and runs on a device if one exists; otherwise it self-skips via exit code
+# 77 (see SKIP_RETURN_CODE below). GPU-heavy runs belong in the separate
+# .github/workflows/cuda.yml job on a self-hosted GPU runner, keeping the
+# default PR pipeline green on CPU-only workers.
+if(NOT NS_ENABLE_CUDA)
+    message(STATUS "NS_ENABLE_CUDA=OFF: CUDA backend tests not registered")
+else()
+    message(STATUS "NS_ENABLE_CUDA=ON: registering CUDA backend tests")
+    find_program(NS_NVCC_EXECUTABLE nvcc)
+    if(NS_NVCC_EXECUTABLE)
+        message(STATUS "nvcc found: ${NS_NVCC_EXECUTABLE}")
+    else()
+        message(STATUS "nvcc not found in PATH; the CUDA test will self-skip")
+    endif()
+
+    add_executable(test_cuda_codegen test_cuda_codegen.cpp)
+    target_link_libraries(test_cuda_codegen ns_core)
+    target_compile_definitions(test_cuda_codegen PRIVATE
+        NS_REPO_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../include"
+        NS_NVCC_PATH="${NS_NVCC_EXECUTABLE}")
+    add_test(NAME test_cuda_codegen COMMAND test_cuda_codegen)
+    set_tests_properties(test_cuda_codegen PROPERTIES
+        SKIP_RETURN_CODE 77
+        TIMEOUT 600)
+endif()

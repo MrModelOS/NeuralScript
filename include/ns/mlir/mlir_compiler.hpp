@@ -33,6 +33,12 @@ enum class MLIROp {
     TRANSPOSE,
     CONSTANT,
 
+    // Reverse-mode (AOT backward pass) ops
+    MATMUL_GRAD_A,     // dA = dC @ B^T      (operands: dC, B)
+    MATMUL_GRAD_W,     // dB = A^T @ dC      (operands: A, dC, Bweight)
+    ACTIVATION_GRAD,   // elementwise jacobian backward (operands: dOut, actInput)
+    LOSS_GRAD,         // loss seed: d(preds) from preds+labels (cross-entropy)
+
     // Control flow
     FN_CALL,           // function call
     FORWARD,           // forward pass
@@ -97,6 +103,7 @@ struct MLIRFunction {
     std::string name;
     std::vector<MLIRInstr> instructions;
     std::string return_id;
+    bool is_train = false;   // network train() method (forward+backward+opt)
 };
 
 struct MLIRModule {
@@ -118,6 +125,11 @@ private:
     int temp_counter_ = 0;
     std::string new_temp(const std::string& prefix = "t");
 
+    // Variable name -> produced value id, scoped per compiled function body.
+    // Allows `var hidden = x @ fc1` to be referenced as `hidden` later.
+    std::map<std::string, std::string> local_var_ids_;
+    void reset_locals() { local_var_ids_.clear(); }
+
     // Top-level `type X = <const|alias>` aliases, for resolving layer dims.
     std::map<std::string, int64_t> aliases_;
     // Layer name -> weight buffer id (network layer params map onto *_w ids).
@@ -132,6 +144,9 @@ private:
     // Resolve a dimension expression value (int literal or alias) to a const,
     // returning false if it is dynamic/symbolic.
     bool resolve_dim_int(const Expr* expr, int64_t& out);
+
+    // Canonical activation name for an activation op (used for grad lowering).
+    static std::string activation_name(MLIROp op);
 
     void collect_aliases(Program& program);
     void compile_fn(Stmt* stmt, MLIRModule& module);

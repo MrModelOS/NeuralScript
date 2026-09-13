@@ -4,20 +4,18 @@
 #include "ns/mlir/mlir_compiler.hpp"
 #include "ns/mlir/fusion.hpp"
 #include "ns/codegen/codegen.hpp"
-#include "ns/autodiff/autodiff.hpp"
 
 #include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 namespace {
 
 void print_usage(const char* prog) {
-    std::cout << "NeuralScript compiler (nsc) v0.1.0\n\n"
+    std::cout << "NeuralScript compiler (nsc) v1.1.0\n\n"
               << "Usage:\n"
               << "  " << prog << " <file.ns> [--mlir] [--cpp] [--cuda] [--runtime] [--check]\n\n"
               << "Options:\n"
@@ -50,7 +48,6 @@ int main(int argc, char** argv) {
     bool dump_mlir = false;
     bool use_cuda = true;
     bool check_only = false;
-    bool dump_grad = false;
     bool emit_runtime = false;
 
     for (int i = 2; i < argc; i++) {
@@ -59,7 +56,6 @@ int main(int argc, char** argv) {
         else if (arg == "--cpp") use_cuda = false;
         else if (arg == "--cuda") use_cuda = true;
         else if (arg == "--check") check_only = true;
-        else if (arg == "--grad") dump_grad = true;
         else if (arg == "--runtime") emit_runtime = true;
         else {
             std::cerr << "Unknown option: " << arg << "\n";
@@ -90,34 +86,6 @@ int main(int argc, char** argv) {
 
         if (check_only) {
             std::cout << "Shape checking passed.\n";
-            return 0;
-        }
-
-        // Stage 3b: Autodiff dump (reverse-mode over grad blocks).
-        if (dump_grad) {
-            ns::GradCompiler gc;
-            // Differentiable leaves = all tensor vars declared at top level.
-            std::unordered_set<std::string> weights;
-            for (auto& d : program.top_level) {
-                if (d->kind == ns::Stmt::VAR_DECL &&
-                    d->var_type && d->var_type->is_tensor()) {
-                    weights.insert(d->var_name);
-                }
-            }
-            bool any = false;
-            for (auto& d : program.top_level) {
-                if (d->kind != ns::Stmt::FN_DECL) continue;
-                auto res = gc.compile_grad_block(d->body.get(), weights);
-                if (res.empty()) continue;
-                any = true;
-                std::cout << "Grad [" << d->fn_name << "]:\n";
-                for (auto& r : res) {
-                    std::cout << "  d(" << r.var << "):\n";
-                    for (auto& c : r.contributions)
-                        std::cout << "    " << c << "\n";
-                }
-            }
-            if (!any) std::cout << "No grad blocks found.\n";
             return 0;
         }
 

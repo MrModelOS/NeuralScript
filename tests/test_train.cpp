@@ -156,7 +156,7 @@ network Net {
         }
     }
 
-    // --- Full training loop: autodiff grads -> Muon (matrix weights). ---
+    // --- Full training loop: numeric grads -> Muon (matrix weights). ---
     {
         NumericTrainer t3(*net, module);
         t3.bind_input("x", X, {NB, F});
@@ -211,6 +211,6 @@ network Net {
         assert(moved > 1e-6);
     }
 
-    std::cout << "PASS: full training loop (autodiff->Muon/AdamW) converges Loss->0\n";
+    std::cout << "PASS: full training loop (numeric grads -> Muon/AdamW) converges Loss->0\n";
     return 0;
 }

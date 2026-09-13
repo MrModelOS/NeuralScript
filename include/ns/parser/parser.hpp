@@ -41,6 +41,7 @@ private:
     StmtPtr parse_expr_stmt();
     StmtPtr parse_type_decl(Token tok);
     StmtPtr parse_layer_decl(Token tok);
+    StmtPtr parse_train_decl(Token tok);
 
     // Expression parsing
     ExprPtr parse_expression();

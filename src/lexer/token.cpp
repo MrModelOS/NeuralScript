@@ -31,6 +31,7 @@ const char* token_type_name(TokenType type) {
         case TokenType::KW_REF: return "ref";
         case TokenType::KW_TYPE: return "type";
         case TokenType::KW_AS: return "as";
+        case TokenType::KW_TRAIN: return "train";
         case TokenType::DTYPE_FLOAT16: return "float16";
         case TokenType::DTYPE_FLOAT32: return "float32";
         case TokenType::DTYPE_FLOAT64: return "float64";

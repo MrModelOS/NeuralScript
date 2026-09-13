@@ -226,6 +226,7 @@ TokenType Lexer::keyword_or_identifier(const std::string& word) {
     if (word == "network") return TokenType::KW_NETWORK;
     if (word == "layer") return TokenType::KW_LAYER;
     if (word == "forward") return TokenType::KW_FORWARD;
+    if (word == "train") return TokenType::KW_TRAIN;
     if (word == "grad") return TokenType::KW_GRAD;
     if (word == "mut") return TokenType::KW_MUT;
     if (word == "ref") return TokenType::KW_REF;

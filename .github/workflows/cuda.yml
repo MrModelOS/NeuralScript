@@ -1,0 +1,32 @@
+name: cuda
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['src/codegen/**', 'include/ns/codegen/**', 'tests/test_cuda_codegen.cpp', 'CMakeLists.txt', 'cmake/**']
+
+jobs:
+  cuda-codegen:
+    runs-on: [self-hosted, linux, x64, gpu]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure with CUDA enabled
+        run: |
+          cmake -S . -B build-cuda \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNS_ENABLE_CUDA=ON \
+            -DNS_BUILD_TESTS=ON
+
+      - name: Build
+        working-directory: build-cuda
+        run: cmake --build . --parallel
+
+      # The test self-skips (exit 77) when nvcc or a CUDA device is missing, so
+      # this job stays green even on GPU-labeled runners without a toolkit; on a
+      # proper CUDA runner it compiles the emitted .cu with nvcc and runs it on
+      # the device.
+      - name: Run CUDA integration test
+        working-directory: build-cuda
+        run: ctest -R test_cuda_codegen --output-on-failure

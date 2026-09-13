@@ -13,8 +13,8 @@ namespace ns {
 // trainable weight buffers (the TENSOR_ALLOC'd matrices of the network), and
 // hands them — per parameter — directly to the optimizer layer
 // (MuonOptimizer::step_param, which applies Muon for 2D matrices and AdamW
-// otherwise). This is the numeric bridge between the compiler's autodiff
-// block and the Phase-4 optimizer library.
+// otherwise). This is the numeric bridge between the forward graph and the
+// optimizer library.
 //
 // Forward numeric semantics deliberately mirror ModuleEvaluator (the trusted
 // CPU reference): matmul (row-major [M,K]x[K,N]), elementwise binops with

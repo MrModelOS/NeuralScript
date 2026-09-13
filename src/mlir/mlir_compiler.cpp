@@ -66,7 +66,24 @@ bool MLIRCompiler::resolve_dim_int(const Expr* expr, int64_t& out) {
     return false;
 }
 
+std::string MLIRCompiler::activation_name(MLIROp op) {
+    switch (op) {
+        case MLIROp::RELU: return "relu";
+        case MLIROp::LEAKY_RELU: return "leaky_relu";
+        case MLIROp::SIGMOID: return "sigmoid";
+        case MLIROp::TANH: return "tanh";
+        case MLIROp::SWISH: return "swish";
+        case MLIROp::GELU: return "gelu";
+        case MLIROp::SILU: return "silu";
+        case MLIROp::IDENTITY: return "identity";
+        case MLIROp::SOFTMAX: return "softmax";
+        case MLIROp::LAYERNORM: return "layernorm";
+        default: return "identity";
+    }
+}
+
 void MLIRCompiler::compile_fn(Stmt* stmt, MLIRModule& module) {
+    reset_locals();
     MLIRFunction fn;
     fn.name = stmt->fn_name;
     compile_stmt(stmt->body.get(), fn);
@@ -74,12 +91,13 @@ void MLIRCompiler::compile_fn(Stmt* stmt, MLIRModule& module) {
 }
 
 void MLIRCompiler::compile_network(Stmt* stmt, MLIRModule& module) {
+    reset_locals();
     MLIRFunction fn;
     fn.name = stmt->network_name;
 
-    // Emit weight buffer allocs for trainable layers BEFORE the forward body.
-    // Dense: weight [in, out]. Layer dims may be constant literals or aliases
-    // (resolved via aliases_); dynamic dims fall back to Tensor dims only.
+    // Weight buffer allocs for trainable layers, shared by forward() AND the
+    // train() method (item: single weight set, no w1/w2 duplication).
+    std::vector<MLIRInstr> weight_allocs;
     for (auto& layer : stmt->layers) {
         if (!layer) continue;
         LayerMeta meta;
@@ -111,7 +129,7 @@ void MLIRCompiler::compile_network(Stmt* stmt, MLIRModule& module) {
         instr.comment = "allocate weight [" + std::to_string(in_d) + ", " +
                         std::to_string(out_d) + "]";
         layer_weight_id_[layer->layer_name] = layer->layer_name + "_w";
-        fn.instructions.push_back(instr);
+        weight_allocs.push_back(instr);
     }
 
     // Note: because the layer's weight shape may differ from the operand that
@@ -119,14 +137,33 @@ void MLIRCompiler::compile_network(Stmt* stmt, MLIRModule& module) {
     // the layer operand weight shape on the matmul below. The alloc above gives
     // the codegen a concrete [in, out] to size the weight buffer.
 
-    // Compile forward
+    // Forward pass(es) -> inference function named after the network.
+    for (auto& w : weight_allocs) fn.instructions.push_back(w);
     for (auto& method : stmt->methods) {
         if (method->kind == Stmt::FORWARD_DECL) {
             compile_stmt(method->body.get(), fn);
         }
     }
-
     module.functions.push_back(std::move(fn));
+    module.functions.back().is_train = false;
+
+    // train() method(s) -> a separate function sharing the SAME weight allocs.
+    // Reverse-mode ops produced by the grad block bind their gradients to the
+    // network weight tensors directly (no separate w1/w2 in the source).
+    MLIRFunction tfn;
+    tfn.name = stmt->network_name + "_train";
+    tfn.is_train = true;
+    bool have_train = false;
+    for (auto& w : weight_allocs) tfn.instructions.push_back(w);
+    for (auto& method : stmt->methods) {
+        if (method->kind == Stmt::TRAIN_DECL) {
+            compile_stmt(method->body.get(), tfn);
+            have_train = true;
+        }
+    }
+    if (have_train) {
+        module.functions.push_back(std::move(tfn));
+    }
 }
 
 void MLIRCompiler::compile_stmt(Stmt* stmt, MLIRFunction& fn) {
@@ -149,6 +186,8 @@ void MLIRCompiler::compile_stmt(Stmt* stmt, MLIRFunction& fn) {
             if (stmt->init_expr) {
                 MLIRValue out;
                 compile_expr(stmt->init_expr.get(), fn, out);
+                if (!stmt->var_name.empty() && !out.id.empty())
+                    local_var_ids_[stmt->var_name] = out.id;
             }
             break;
         }
@@ -159,12 +198,109 @@ void MLIRCompiler::compile_stmt(Stmt* stmt, MLIRFunction& fn) {
             break;
         }
         case Stmt::GRAD_BLOCK: {
-            // Emit GRAD marker
-            auto instr = MLIRInstr(MLIROp::GRAD, "");
-            instr.comment = "gradient block";
-            fn.instructions.push_back(instr);
+            // AOT forward+backward: compile the grad body forward, then lower
+            // the reverse-mode tape into backward MLIR ops plus an OPT_STEP.
+            auto marker = MLIRInstr(MLIROp::GRAD, "");
+            marker.comment = "gradient block (forward)";
+            fn.instructions.push_back(marker);
+
+            size_t fwd_start = fn.instructions.size();
             if (stmt->grad_body) {
                 compile_stmt(stmt->grad_body.get(), fn);
+            }
+            size_t fwd_end = fn.instructions.size();
+
+            // Reverse-mode lowering over the range [fwd_start, fwd_end).
+            std::map<std::string, std::string> g; // result_id -> grad id
+            for (size_t idx = fwd_end; idx > fwd_start; --idx) {
+                // Copy by value: backward instrs are appended to the same
+                // vector, which would invalidate a reference on realloc.
+                const MLIRInstr i = fn.instructions[idx - 1];
+                switch (i.op) {
+                    case MLIROp::CROSS_ENTROPY: {
+                        // Seed: dL/d(preds) = (softmax(preds) - labels) / B.
+                        auto lg = MLIRInstr(MLIROp::LOSS_GRAD, new_temp("g"));
+                        lg.operands = i.operands; // preds, labels
+                        lg.attribute = "cross_entropy";
+                        lg.comment = "d(cross_entropy)/d(preds)";
+                        fn.instructions.push_back(lg);
+                        g[i.result_id] = lg.result_id;
+                        if (!i.operands.empty()) g[i.operands[0]] = lg.result_id;
+                        break;
+                    }
+                    case MLIROp::MATMUL: {
+                        auto cit = g.find(i.result_id);
+                        if (cit == g.end() || i.operands.size() < 2) break;
+                        // dA = dC @ B^T
+                        auto ia = MLIRInstr(MLIROp::MATMUL_GRAD_A, new_temp("g"));
+                        ia.operands = {cit->second, i.operands[1]};
+                        ia.comment = "d" + i.operands[0] + " = d" + i.result_id + " @ " + i.operands[1] + "^T";
+                        fn.instructions.push_back(ia);
+                        // dB = A^T @ dC  (operands: A, dC, Bweight)
+                        auto iw = MLIRInstr(MLIROp::MATMUL_GRAD_W, new_temp("g"));
+                        iw.operands = {i.operands[0], cit->second, i.operands[1]};
+                        iw.comment = "d" + i.operands[1] + " = " + i.operands[0] + "^T @ d" + i.result_id;
+                        fn.instructions.push_back(iw);
+                        g[i.operands[0]] = ia.result_id;
+                        g[i.operands[1]] = iw.result_id;
+                        break;
+                    }
+                    case MLIROp::RELU: case MLIROp::LEAKY_RELU: case MLIROp::SIGMOID:
+                    case MLIROp::TANH: case MLIROp::SWISH: case MLIROp::GELU:
+                    case MLIROp::SILU: case MLIROp::IDENTITY:
+                    case MLIROp::SOFTMAX: case MLIROp::LAYERNORM: {
+                        auto cit = g.find(i.result_id);
+                        if (cit == g.end() || i.operands.empty()) break;
+                        auto ig = MLIRInstr(MLIROp::ACTIVATION_GRAD, new_temp("g"));
+                        ig.operands = {cit->second, i.operands[0]};
+                        ig.attribute = activation_name(i.op);
+                        ig.comment = "d" + i.operands[0] + " = d" + i.result_id + " * act'(in)";
+                        fn.instructions.push_back(ig);
+                        g[i.operands[0]] = ig.result_id;
+                        break;
+                    }
+                    case MLIROp::DROPOUT: {
+                        // Inverted dropout: forward saves a scaled binary mask
+                        // m[i] = (keep ? 1/(1-p) : 0); backward is dOut * m.
+                        if (i.operands.empty()) break;
+                        auto cit = g.find(i.result_id);
+                        if (cit == g.end()) break;
+                        auto ig = MLIRInstr(MLIROp::ACTIVATION_GRAD, new_temp("g"));
+                        ig.operands = {cit->second, i.result_id};
+                        ig.attribute = "dropout";
+                        ig.comment = "d" + i.operands[0] + " = d" + i.result_id +
+                                     " * dropout_mask";
+                        fn.instructions.push_back(ig);
+                        g[i.operands[0]] = ig.result_id;
+                        break;
+                    }
+                    default:
+                        break;
+                }
+            }
+
+            // Optimizer step: pair each weight alloc in fn with its gradient.
+            std::vector<std::string> opt_ops;
+            for (auto& instr : fn.instructions) {
+                if (instr.op != MLIROp::TENSOR_ALLOC) continue;
+                auto git = g.find(instr.result_id);
+                if (git != g.end()) {
+                    opt_ops.push_back(instr.result_id);
+                    opt_ops.push_back(git->second);
+                }
+            }
+            if (!opt_ops.empty()) {
+                auto opt = MLIRInstr(MLIROp::OPT_STEP, "");
+                opt.operands = std::move(opt_ops);
+                opt.attribute = "muon";
+                opt.comment = "optimizer step (Muon / AdamW)";
+                fn.instructions.push_back(opt);
+            }
+            break;
+        }
+        case Stmt::TRAIN_DECL: {
+            if (stmt->body) {
+                compile_stmt(stmt->body.get(), fn);
             }
             break;
         }
@@ -208,6 +344,8 @@ void MLIRCompiler::compile_stmt(Stmt* stmt, MLIRFunction& fn) {
             if (stmt->init_expr) {
                 MLIRValue out;
                 compile_expr(stmt->init_expr.get(), fn, out);
+                if (!stmt->var_name.empty() && !out.id.empty())
+                    local_var_ids_[stmt->var_name] = out.id;
             }
             break;
         }
@@ -232,6 +370,16 @@ void MLIRCompiler::compile_expr(Expr* expr, MLIRFunction& fn, MLIRValue& out) {
         }
         case Expr::IDENTIFIER: {
             out.id = expr->token.value;
+            // Local var binding first (mirrors source-level shadowing), then
+            // network layer names resolve to their weight tensors so train()
+            // can write `batch_x @ fc1` directly.
+            auto lit = local_var_ids_.find(out.id);
+            if (lit != local_var_ids_.end()) {
+                out.id = lit->second;
+            } else {
+                auto wit = layer_weight_id_.find(out.id);
+                if (wit != layer_weight_id_.end()) out.id = wit->second;
+            }
             if (expr->inferred_type && expr->inferred_type->is_tensor()) {
                 out.type = expr->inferred_type->tensor_type;
             }
@@ -271,6 +419,15 @@ void MLIRCompiler::compile_expr(Expr* expr, MLIRFunction& fn, MLIRValue& out) {
             else if (func == "Dense" || func == "Linear") op = MLIROp::LAYER_DENSE;
             else if (func == "Dropout") op = MLIROp::LAYER_DROPOUT;
             else if (func == "LayerNorm") op = MLIROp::LAYER_LAYERNORM;
+            else if (func == "relu") op = MLIROp::RELU;
+            else if (func == "leaky_relu") op = MLIROp::LEAKY_RELU;
+            else if (func == "sigmoid") op = MLIROp::SIGMOID;
+            else if (func == "tanh") op = MLIROp::TANH;
+            else if (func == "silu" || func == "swish") op = MLIROp::SWISH;
+            else if (func == "gelu") op = MLIROp::GELU;
+            else if (func == "softmax") op = MLIROp::SOFTMAX;
+            else if (func == "identity") op = MLIROp::IDENTITY;
+            else if (func == "dropout") op = MLIROp::DROPOUT;
             else op = MLIROp::FN_CALL;
 
             auto instr = MLIRInstr(op, new_temp("f"));
@@ -282,6 +439,14 @@ void MLIRCompiler::compile_expr(Expr* expr, MLIRFunction& fn, MLIRValue& out) {
                 MLIRValue a;
                 compile_expr(arg.get(), fn, a);
                 instr.operands.push_back(a.id);
+            }
+            if (op == MLIROp::DROPOUT && expr->args.size() >= 2) {
+                Expr* rate_arg = expr->args[1].get();
+                if (rate_arg->kind == Expr::LITERAL_INT ||
+                    rate_arg->kind == Expr::LITERAL_FLOAT) {
+                    try { instr.float_attr = std::stod(rate_arg->token.value); }
+                    catch (...) { }
+                }
             }
             instr.comment = func + "()";
             fn.instructions.push_back(instr);
@@ -347,13 +512,25 @@ void MLIRCompiler::lower_activation(const std::string& act, MLIRValue& in,
 void MLIRCompiler::apply_pipeline_stage(const std::string& wname, MLIRValue& in,
                                         MLIRFunction& fn, MLIRValue& out) {
     auto miter = layer_meta_.find(wname);
-    if (miter != layer_meta_.end() && miter->second.type == "Dropout") {
-        auto instr = MLIRInstr(MLIROp::DROPOUT, new_temp("fc"));
-        instr.operands = {in.id};
-        instr.comment = "dropout(" + in.id + ")";
-        fn.instructions.push_back(instr);
-        out.id = instr.result_id;
-        return;
+    if (miter != layer_meta_.end()) {
+        if (miter->second.type != "Dense" && miter->second.type != "Linear" &&
+            miter->second.type != "Dropout") {
+            throw std::runtime_error(
+                "Unsupported layer type '" + miter->second.type +
+                "' in AOT pipeline lowering (layer '" + wname +
+                "'). Only Dense/Linear and Dropout layers can be lowered; " +
+                "Attention/Embedding/LayerNorm kernels are not yet implemented.");
+        }
+        if (miter->second.type == "Dropout") {
+            auto instr = MLIRInstr(MLIROp::DROPOUT, new_temp("fc"));
+            instr.operands = {in.id};
+            instr.float_attr = miter->second.dropout_rate;
+            instr.comment = "dropout(" + in.id + ", p=" +
+                            std::to_string(miter->second.dropout_rate) + ")";
+            fn.instructions.push_back(instr);
+            out.id = instr.result_id;
+            return;
+        }
     }
 
     auto wit = layer_weight_id_.find(wname);
@@ -413,6 +590,10 @@ std::string MLIRCompiler::dump(MLIRModule& module) {
                 case MLIROp::DROPOUT: oss << "ns.dropout"; break;
                 case MLIROp::LAYERNORM: oss << "ns.layernorm"; break;
                 case MLIROp::CROSS_ENTROPY: oss << "ns.cross_entropy"; break;
+                case MLIROp::MATMUL_GRAD_A: oss << "ns.grad.matmul.a"; break;
+                case MLIROp::MATMUL_GRAD_W: oss << "ns.grad.matmul.w"; break;
+                case MLIROp::ACTIVATION_GRAD: oss << "ns.grad.activation"; break;
+                case MLIROp::LOSS_GRAD: oss << "ns.grad.loss"; break;
                 case MLIROp::GRAD: oss << "ns.grad"; break;
                 case MLIROp::FORWARD: oss << "ns.forward"; break;
                 case MLIROp::LAYER_DENSE: oss << "ns.layer.dense"; break;
@@ -422,6 +603,7 @@ std::string MLIRCompiler::dump(MLIRModule& module) {
                 case MLIROp::LAYER_LAYERNORM: oss << "ns.layer.layernorm"; break;
                 case MLIROp::CONSTANT: oss << "ns.constant"; break;
                 case MLIROp::FN_CALL: oss << "ns.fn.call"; break;
+                case MLIROp::OPT_STEP: oss << "ns.opt.step"; break;
                 case MLIROp::FUSED: oss << "ns.fused"; break;
                 default: oss << "ns.op"; break;
             }

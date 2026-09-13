@@ -1,4 +1,5 @@
-// NeuralScript example: MLP classifier with compile-time shape verification.
+// NeuralScript example: MLP classifier with compile-time shape verification
+// and an AOT-compiled training step (train()) that shares the network weights.
 //
 // Build & inspect:
 //   ./build/nsc examples/mlp.ns --check     # static shape verification only
@@ -11,7 +12,7 @@ type Batch    = Dynamic     // symbolic batch dim, resolved at runtime entry
 type Features = 784         // constant
 type Classes  = 10          // constant
 
-// ---- Model definition: pipeline operator (->) composition ----
+// ---- Model definition: single weight set per layer ----
 network MLPClassifier {
     input:  Tensor[Batch, Features] float32
     output: Tensor[Batch, Classes] float32
@@ -23,35 +24,26 @@ network MLPClassifier {
     forward(x) {
         return x -> fc1 -> drop -> fc2
     }
-}
 
-// ---- Training step: grad-block isolates the backward graph ----
-fn train_step(batch_x: Tensor[Batch, 784],
-              batch_y: Tensor[Batch, 10]) -> float32 {
-    var w1: Tensor[784, 512] float32
-    var w2: Tensor[512, 10] float32
-
-    grad {
-        // Backward graph is isolated here: intermediates become
-        // eligible for immediate free (liveness) or activation recompute.
-        var hidden = batch_x @ w1
-        var preds  = hidden @ w2
-        var loss   = cross_entropy(preds, batch_y)
+    // Training step: the grad{} block drives the compiler's AOT reverse-mode
+    // lowering. Layer names (fc1, fc2) bind directly to the network weight
+    // tensors (fc1_w, fc2_w) -- no duplicated w1/w2. The compiler appends the
+    // optimizer step (Muon for matrices, AdamW otherwise) after the backward
+    // tape, and the C-ABI exposes it as ns_runtime_train_step.
+    train(batch_x: Tensor[Batch, Features],
+          batch_y: Tensor[Batch, Classes]) -> float32 {
+        grad {
+            var hidden = batch_x @ fc1
+            var act    = relu(hidden)
+            var preds  = act @ fc2
+            var loss   = cross_entropy(preds, batch_y)
+        }
+        return loss
     }
-
-    return 0.0
-}
-
-// ---- Inference path: forward only ----
-fn infer(x: Tensor[Batch, 784]) -> Tensor[Batch, 10] {
-    var w1: Tensor[784, 512] float32
-    var w2: Tensor[512, 10] float32
-    return x @ w1 @ w2
 }
 
 // Compile-time checks performed here:
-//   [Batch, 784] @ [784, 512] -> [Batch, 512]   (inner 784 == 784)   OK
-//   [Batch, 512] @ [512, 10]  -> [Batch, 10]    (inner 512 == 512)   OK
-//
-// Any shape mismatch in '@' aborts the build with an exact diagnostic
-// before any runtime code is produced.
+//   forward: [Batch, 784] -> fc1 -> drop -> fc2 -> [Batch, 10]
+//   train:   [Batch, 784] @ [784, 512] -> relu -> @ [512, 10] -> cross_entropy
+// Any shape mismatch in '@' aborts the build with an exact diagnostic before
+// any runtime code is produced.

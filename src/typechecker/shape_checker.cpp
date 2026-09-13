@@ -69,6 +69,9 @@ void ShapeChecker::check_stmt(Stmt* stmt) {
         case Stmt::FORWARD_DECL:
             check_stmt(stmt->body.get());
             break;
+        case Stmt::TRAIN_DECL:
+            check_stmt(stmt->body.get());
+            break;
         case Stmt::VAR_ASSIGN:
             if (stmt->init_expr) check_expr(stmt->init_expr.get());
             break;
@@ -186,6 +189,26 @@ void ShapeChecker::check_network_decl(Stmt* stmt) {
     for (auto& layer : stmt->layers) {
         layer_rules_[layer->layer_name] = parse_layer_rule(layer.get());
         check_stmt(layer.get());
+        // Register the trainable weight matrix as a tensor variable, so train()
+        // methods can reference layers (e.g. `batch_x @ fc1`) directly and the
+        // weight folds into the network's weight set (no w1/w2 duplication).
+        if ((layer->layer_type == "Dense" || layer->layer_type == "Linear") &&
+            variables_.count(layer->layer_name) == 0) {
+            auto riter = layer_rules_.find(layer->layer_name);
+            if (riter != layer_rules_.end() && riter->second.in.kind != DimExpr::DYNAMIC &&
+                riter->second.out.kind != DimExpr::DYNAMIC) {
+                DimExpr din = riter->second.in;
+                DimExpr dout = riter->second.out;
+                bind_alias_dim(din);
+                bind_alias_dim(dout);
+                if (din.is_const() && dout.is_const()) {
+                    TensorType wt;
+                    wt.dtype = Dtype::Float32;
+                    wt.dims = {din, dout};
+                    variables_[layer->layer_name] = std::make_unique<TypeNode>(wt);
+                }
+            }
+        }
     }
 
     // Capture declared network input type (used to type forward params).
@@ -220,6 +243,18 @@ void ShapeChecker::check_network_decl(Stmt* stmt) {
                 } else {
                     variables_[p.name] = std::make_unique<TypeNode>(*p.type);
                 }
+            }
+        }
+    }
+
+    // Register train() params in scope (typed by their declared Tensor types).
+    for (auto& method : stmt->methods) {
+        if (method->kind != Stmt::TRAIN_DECL) continue;
+        for (auto& p : method->params) {
+            if (p.type) {
+                variables_[p.name] = std::make_unique<TypeNode>(*p.type);
+            } else {
+                variables_[p.name] = std::make_unique<TypeNode>(Dtype::Float32);
             }
         }
     }
@@ -475,6 +510,17 @@ void ShapeChecker::check_expr(Expr* expr) {
                        func_name == "Attention" || func_name == "Embedding") {
                 // Layer constructors produce a layer object; infer minimal
                 expr->inferred_type = std::make_unique<TypeNode>(Dtype::Float32);
+            } else if (func_name == "relu" || func_name == "leaky_relu" ||
+                       func_name == "sigmoid" || func_name == "tanh" ||
+                       func_name == "silu" || func_name == "swish" ||
+                       func_name == "gelu" || func_name == "softmax" ||
+                       func_name == "identity" || func_name == "dropout") {
+                // Elementwise activation: shape-preserving passthrough.
+                if (!expr->args.empty() && expr->args[0]->inferred_type) {
+                    expr->inferred_type = std::make_unique<TypeNode>(*expr->args[0]->inferred_type);
+                } else {
+                    expr->inferred_type = std::make_unique<TypeNode>(Dtype::Float32);
+                }
             } else if (func_name == "forward" || func_name == "step") {
                 // Network method call; result is a tensor (passthrough).
                 if (!expr->args.empty() && expr->args[0]->inferred_type) {

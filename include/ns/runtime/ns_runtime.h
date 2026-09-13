@@ -7,6 +7,14 @@
 extern "C" {
 #endif
 
+/* Version of the ABI/interface this header implements. The generated model
+ * sources are produced by the matching compiler release.
+ */
+#define NS_RUNTIME_VERSION_MAJOR 1
+#define NS_RUNTIME_VERSION_MINOR 1
+#define NS_RUNTIME_VERSION_PATCH 0
+#define NS_RUNTIME_VERSION "1.1.0"
+
 /* NeuralScript AOT runtime C-ABI.
  *
  * A compiled model is a self-contained translation unit that implements this
@@ -24,7 +32,7 @@ typedef struct ns_model ns_model;
 /* One trainable parameter in the concatenated weight layout. */
 typedef struct ns_weight_desc {
     const char* name;   /* layer weight name, e.g. "fc1_w" */
-    size_t      offset; /* byte offset within the weight blob (floats*4) */
+    size_t      offset; /* float offset of the start of this weight in the blob */
     size_t      count;  /* number of floats */
 } ns_weight_desc;
 
@@ -51,11 +59,40 @@ size_t ns_model_output_numel(const ns_model* m, size_t input_numel);
 /* Number of floats the compiled graph expects in the weights blob. */
 size_t ns_model_weight_count(const ns_model* m);
 
+/* Same as ns_model_weight_count, but does not require a model instance: the
+ * generated graph's blob size is fixed at compile time, so a host can size
+ * its weight buffer before ns_runtime_init. */
+size_t ns_weight_count_static(void);
+
+/* Copy the full weight blob out of the model. Returns 0 on success, -1 if
+ * m/out is null or n does not match ns_model_weight_count(m). */
+int ns_model_get_weights(const ns_model* m, float* out, size_t n);
+
 /* The concatenated weight layout of the compiled graph. */
 const ns_weight_layout* ns_model_layout(const ns_model* m);
 
 /* Free the model and its buffers. */
 void ns_free(ns_model* m);
+
+/* ---- AOT training (present when the network defines a train() method) ----
+ *
+ * The generated training core shares the SAME weight blob as inference, so a
+ * host loop can do: ns_eval_infer(...); ns_runtime_train_step(...); continue.
+ *
+ * input : batch-major features, input_numel floats (batch * in_cols).
+ * labels: batch-major one-hot classes, input_numel / in_cols * out_cols floats.
+ * loss_out: receives the mean cross-entropy loss over the batch.
+ * lr    : learning rate for the compiled optimizer (Muon for matrices,
+ *         AdamW otherwise). Runs forward + backward + one optimizer step and
+ *         writes the updated weights back into the model.
+ * Returns 0 on success, non-zero on error. */
+int ns_runtime_train_step(ns_model* m, const float* input, const float* labels,
+                          size_t input_numel, float* loss_out, float lr);
+
+/* Forward-only objective: computes the mean cross-entropy loss WITHOUT
+ * updating weights. Returns 0 on success. */
+int ns_objective_loss(ns_model* m, const float* input, const float* labels,
+                      size_t input_numel, float* loss_out);
 
 #ifdef __cplusplus
 }

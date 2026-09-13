@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  build-test:
+    name: Build & test (gcc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CXX_FLAGS="-Wall -Wextra"
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  asan:
+    name: Sanitizers (ASan + UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -B build-asan -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+      - name: Build
+        run: cmake --build build-asan --parallel
+      - name: Test
+        env:
+          ASAN_OPTIONS: "detect_leaks=1"
+          UBSAN_OPTIONS: "halt_on_error=1"
+        run: ctest --test-dir build-asan --output-on-failure
+
+  install:
+    name: Install & find_package smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Install
+        run: cmake --install build --prefix /tmp/ns
+      - name: Smoke test
+        working-directory: /tmp
+        run: |
+          mkdir app && cd app
+          cat > CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.20)
+          project(App CXX)
+          find_package(NeuralScript REQUIRED)
+          add_executable(app main.cpp)
+          target_link_libraries(app NeuralScript::ns_core)
+          EOF
+          printf '#include "ns/lexer/lexer.hpp"\nint main() { ns::Lexer l(""); auto t = l.tokenize(); return (int)t.size() == 0 ? 0 : 0; }\n' > main.cpp
+          cmake -DCMAKE_PREFIX_PATH=/tmp/ns . && cmake --build .

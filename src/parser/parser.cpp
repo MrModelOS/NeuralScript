@@ -133,6 +133,10 @@ StmtPtr Parser::parse_statement() {
             stmt->body = parse_block();
             return stmt;
         }
+        case TokenType::KW_TRAIN: {
+            // train(x, y) -> loss_type { grad { ... } }
+            return parse_train_decl(advance());
+        }
         default:
             return parse_expr_stmt();
     }
@@ -184,6 +188,33 @@ StmtPtr Parser::parse_fn_decl(Token tok) {
     return stmt;
 }
 
+StmtPtr Parser::parse_train_decl(Token tok) {
+    // train(x: Tensor[Batch, F], y: Tensor[Batch, C]) -> float32 { grad { ... } }
+    auto stmt = std::make_unique<Stmt>(Stmt::TRAIN_DECL, tok);
+
+    expect(TokenType::OP_LPAREN, "expected ( after train");
+    while (!check(TokenType::OP_RPAREN)) {
+        Stmt::Param param;
+        param.is_mut = match(TokenType::KW_MUT);
+        param.is_ref = match(TokenType::KW_REF);
+        Token pname = expect(TokenType::IDENTIFIER, "Expected parameter name");
+        param.name = pname.value;
+        if (match(TokenType::OP_COLON)) {
+            param.type = parse_type();
+        }
+        stmt->params.push_back(std::move(param));
+        if (!match(TokenType::OP_COMMA)) break;
+    }
+    expect(TokenType::OP_RPAREN, "expected ) after train params");
+
+    if (match(TokenType::OP_PIPELINE) || match(TokenType::OP_COLON)) {
+        stmt->return_type = parse_type();
+    }
+
+    stmt->body = parse_block();
+    return stmt;
+}
+
 StmtPtr Parser::parse_network_decl(Token tok) {
     auto stmt = std::make_unique<Stmt>(Stmt::NETWORK_DECL, tok);
 
@@ -210,6 +241,9 @@ StmtPtr Parser::parse_network_decl(Token tok) {
             stmt->layers.push_back(parse_layer_decl(previous()));
         }
         else if (check(TokenType::KW_FORWARD)) {
+            stmt->methods.push_back(parse_statement());
+        }
+        else if (check(TokenType::KW_TRAIN)) {
             stmt->methods.push_back(parse_statement());
         }
         else if (check(TokenType::KW_TYPE)) {
@@ -460,7 +494,8 @@ ExprPtr Parser::parse_postfix() {
             expr = std::move(index_expr);
         } else if (match(TokenType::OP_DOT)) {
             // Member access or method call: model.forward(...) / opt.step(model)
-            if (!check(TokenType::IDENTIFIER) && !check(TokenType::KW_FORWARD)) {
+            if (!check(TokenType::IDENTIFIER) && !check(TokenType::KW_FORWARD) &&
+                !check(TokenType::KW_TRAIN)) {
                 error(peek(), "expected member name after '.'");
             }
             Token member = advance();
