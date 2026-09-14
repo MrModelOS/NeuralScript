@@ -24,6 +24,10 @@ target_link_libraries(test_codegen_cpu ns_core)
 add_test(NAME test_codegen_cpu COMMAND test_codegen_cpu)
 set_tests_properties(test_codegen_cpu PROPERTIES TIMEOUT 120)
 
+add_executable(test_dynamic_dims test_dynamic_dims.cpp)
+target_link_libraries(test_dynamic_dims ns_core)
+add_test(NAME test_dynamic_dims COMMAND test_dynamic_dims)
+
 add_executable(test_fusion test_fusion.cpp)
 target_link_libraries(test_fusion ns_core)
 add_test(NAME test_fusion COMMAND test_fusion)

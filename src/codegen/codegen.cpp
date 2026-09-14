@@ -3,6 +3,7 @@
 #include <sstream>
 #include <cmath>
 #include <map>
+#include <set>
 #include <algorithm>
 
 namespace ns {
@@ -1128,7 +1129,66 @@ std::string CodeGenerator::gen_cpu(const MLIRModule& module, const CodegenOption
 
         oss << "\n// ---- C-ABI (host entry points) ----\n";
         oss << "#include <cstring>\n";
-        oss << "typedef struct ns_model { float* w; size_t n; } ns_model;\n"
+
+        // ---- Per-model CPU context (intermediate buffers, dropout masks,
+        //      optimizer moments and the dropout RNG). Everything that used to
+        //      live in function-scope statics of ns_train_core now belongs to
+        //      the model instance, so two ns_model objects (or re-entrant
+        //      calls) in one process can never interfere. Mirrors the CUDA
+        //      NSContext design. ----
+        const MLIRFunction* tfn_ = nullptr;
+        for (auto& f : module.functions) { if (f.is_train) { tfn_ = &f; break; } }
+
+        {
+            struct IX { bool is_weight = false; };
+            map<string, IX> sc;
+            set<string> opt_wts;
+            if (tfn_) {
+                for (auto& ins : tfn_->instructions) {
+                    if (ins.result_id.empty()) continue;
+                    auto& e = sc[ins.result_id];
+                    e.is_weight = ins.op == MLIROp::TENSOR_ALLOC;
+                }
+                for (auto& ins : tfn_->instructions)
+                    for (auto& op : ins.operands) sc.emplace(std::make_pair(op, IX()));
+                // Mirror emit_train_core's runtime I/O detection: the first
+                // non-weight GEMM A (batch features) and the CE label operand
+                // are passed in as raw pointers, never stored in the context.
+                string xid_, yid_;
+                for (auto& ins : tfn_->instructions) {
+                    if (ins.op == MLIROp::MATMUL && ins.operands.size() >= 2 &&
+                        !sc[ins.operands[0]].is_weight && xid_.empty())
+                        xid_ = ins.operands[0];
+                    if (ins.op == MLIROp::CROSS_ENTROPY && ins.operands.size() >= 2)
+                        yid_ = ins.operands[1];
+                }
+                oss << "typedef struct ns_cpu_ctx {\n";
+                for (auto& [id, ix] : sc) {
+                    if (id == xid_ || id == yid_) continue;
+                    oss << "  std::vector<float> buf_" << id << ";\n";
+                }
+                for (auto& ins : tfn_->instructions)
+                    if (ins.op == MLIROp::DROPOUT)
+                        oss << "  std::vector<float> buf_dm_" << ins.result_id << ";\n";
+                for (auto& ins : tfn_->instructions) {
+                    if (ins.op != MLIROp::OPT_STEP) continue;
+                    for (size_t i = 0; i + 1 < ins.operands.size(); i += 2) {
+                        string wt = ins.operands[i];
+                        if (!opt_wts.count(wt)) {
+                            oss << "  std::vector<float> st_m_" << wt << ", st_am_" << wt << ", st_av_" << wt << ";\n"
+                                << "  size_t st_t_" << wt << " = 0;\n";
+                            opt_wts.insert(wt);
+                        }
+                    }
+                }
+                oss << "  std::mt19937 rng;\n"
+                    << "  ns_cpu_ctx() : rng(0x9E3779B9u) {}\n"
+                    << "} ns_cpu_ctx;\n";
+            } else {
+                oss << "typedef struct ns_cpu_ctx { std::mt19937 rng; ns_cpu_ctx() : rng(0x9E3779B9u) {} } ns_cpu_ctx;\n";
+            }
+        }
+        oss << "typedef struct ns_model { float* w; size_t n; ns_cpu_ctx* ctx; } ns_model;\n"
             << "typedef struct ns_weight_desc { const char* name; size_t offset; size_t count; } ns_weight_desc;\n"
             << "typedef struct ns_weight_layout { size_t num_weights; const ns_weight_desc* desc; } ns_weight_layout;\n\n";
 
@@ -1154,8 +1214,9 @@ std::string CodeGenerator::gen_cpu(const MLIRModule& module, const CodegenOption
 
         oss << "extern \"C\" ns_model* ns_runtime_init(const float* weights, size_t num_floats) {\n";
         oss << "    if (num_floats != ns_weight_total) return nullptr;\n";
-        oss << "    ns_model* m = new ns_model{ new float[ns_weight_total], ns_weight_total };\n";
-        oss << "    if (!m->w) { delete m; return nullptr; }\n";
+        oss << "    ns_cpu_ctx* ctx = new ns_cpu_ctx();\n";
+        oss << "    ns_model* m = new ns_model{ new float[ns_weight_total], ns_weight_total, ctx };\n";
+        oss << "    if (!m->w) { delete ctx; delete m; return nullptr; }\n";
         oss << "    std::memcpy(m->w, weights, ns_weight_total * sizeof(float));\n";
         oss << "    return m;\n";
         oss << "}\n\n";
@@ -1182,7 +1243,7 @@ std::string CodeGenerator::gen_cpu(const MLIRModule& module, const CodegenOption
         oss << "    (void)m; return &ns_layout;\n";
         oss << "}\n\n";
         oss << "extern \"C\" void ns_free(ns_model* m) {\n";
-        oss << "    if (!m) return; delete[] m->w; delete m;\n";
+        oss << "    if (!m) return; delete m->ctx; delete[] m->w; delete m;\n";
         oss << "}\n";
 
         // ---- AOT training (network train() method present) ----
@@ -1195,14 +1256,14 @@ std::string CodeGenerator::gen_cpu(const MLIRModule& module, const CodegenOption
                 << "                                        const float* labels, size_t input_numel,\n"
                 << "                                        float* loss_out, float lr) {\n"
                 << "    if (!m || !m->w) return -1;\n"
-                << "    ns_train_core(input, input_numel, labels, m->w, m->w, loss_out, lr, 1);\n"
+                << "    ns_train_core(m->ctx, input, input_numel, labels, m->w, m->w, loss_out, lr, 1);\n"
                 << "    return 0;\n"
                 << "}\n\n"
                 << "extern \"C\" int ns_objective_loss(ns_model* m, const float* input,\n"
                 << "                                   const float* labels, size_t input_numel,\n"
                 << "                                   float* loss_out) {\n"
                 << "    if (!m || !m->w) return -1;\n"
-                << "    ns_train_core(input, input_numel, labels, m->w, (float*)0, loss_out, 0.f, 0);\n"
+                << "    ns_train_core(m->ctx, input, input_numel, labels, m->w, (float*)0, loss_out, 0.f, 0);\n"
                 << "    return 0;\n"
                 << "}\n";
             break;
@@ -1269,16 +1330,18 @@ std::string CodeGenerator::emit_train_core(const MLIRFunction& tfn, int64_t in_c
     };
 
     ostringstream oss;
-    oss << "extern \"C\" void ns_train_core(const float* x, size_t nx, const float* y,\n"
+    oss << "extern \"C\" void ns_train_core(ns_cpu_ctx* ctx, const float* x, size_t nx, const float* y,\n"
         << "                              const float* w, float* wout, float* loss_out,\n"
         << "                              float lr, int train_mode) {\n";
     oss << "  (void)y;\n";
-    for (auto& [id, inf] : ids)
-        oss << "  static std::vector<float> buf_" << id << ";\n";
+    for (auto& [id, inf] : ids) {
+        if (id == x_id || id == y_id) continue;
+        oss << "  std::vector<float>& buf_" << id << " = ctx->buf_" << id << ";\n";
+    }
     for (auto& instr : tfn.instructions)
         if (instr.op == MLIROp::DROPOUT)
-            oss << "  static std::vector<float> buf_dm_" << instr.result_id
-                << ";  // dropout mask (inverted, scaled)\n";
+            oss << "  std::vector<float>& buf_dm_" << instr.result_id
+                << " = ctx->buf_dm_" << instr.result_id << ";  // dropout mask (inverted, scaled)\n";
 
     // Load weights from the host blob (offsets match the forward layout).
     {
@@ -1339,10 +1402,9 @@ std::string CodeGenerator::emit_train_core(const MLIRFunction& tfn, int64_t in_c
                 fwd_body += "    buf_dm_" + id + ".resize(zn);\n";
                 fwd_body += "    const float* src = " + src_of(in) + ";\n";
                 fwd_body += "    if (train_mode) {\n";
-                fwd_body += "      static std::mt19937 ns_dropout_rng(0x9E3779B9u);\n";
                 fwd_body += "      std::bernoulli_distribution keep(1.0 - " + r + ");\n";
                 fwd_body += "      const float scale = 1.0f / (float)(1.0 - " + r + ");\n";
-                fwd_body += "      for (size_t i = 0; i < zn; i++) { float m = keep(ns_dropout_rng) ? scale : 0.f; buf_dm_" + id + "[i] = m; buf_" + id + "[i] = src[i] * m; }\n";
+                fwd_body += "      for (size_t i = 0; i < zn; i++) { float m = keep(ctx->rng) ? scale : 0.f; buf_dm_" + id + "[i] = m; buf_" + id + "[i] = src[i] * m; }\n";
                 fwd_body += "    } else {\n";
                 fwd_body += "      for (size_t i = 0; i < zn; i++) buf_" + id + "[i] = src[i];\n";
                 fwd_body += "    }\n";
@@ -1432,7 +1494,7 @@ std::string CodeGenerator::emit_train_core(const MLIRFunction& tfn, int64_t in_c
                     bool use_muon = (r > 1 && c > 1 && std::min(r, c) >= 8);
 opt_body += "  { size_t n_ = " + to_string(n) + ";\n";
                     if (use_muon) {
-                        opt_body += "    static std::vector<float> st_m; static std::vector<float> st_am; static std::vector<float> st_av;\n";
+                        opt_body += "    std::vector<float>& st_m = ctx->st_m_" + wt + "; std::vector<float>& st_am = ctx->st_am_" + wt + "; std::vector<float>& st_av = ctx->st_av_" + wt + ";\n";
                         opt_body += "    if (st_m.size() != n_) { st_m.assign(n_, 0.f); st_am.assign(n_, 0.f); st_av.assign(n_, 0.f); }\n";
                         opt_body += "    for (size_t i = 0; i < n_; i++) st_m[i] = " + fmt_float(optim::kMuonMomentum) + "f * st_m[i] + buf_" + g + "[i];\n";
                         opt_body += "    ns_orthonom(st_m.data(), (size_t)" + to_string(r) + ", (size_t)" + to_string(c) + ");\n";
@@ -1441,7 +1503,7 @@ opt_body += "  { size_t n_ = " + to_string(n) + ";\n";
                         opt_body += "    for (size_t i = 0; i < n_; i++) buf_" + wt + "[i] -= le * st_m[i] + (" + fmt_float(optim::kMuonDecay) + "f * lr) * buf_" + wt + "[i];\n";
                         opt_body += "    std::fill(st_m.begin(), st_m.end(), 0.f);\n";
                     } else {
-                        opt_body += "    static std::vector<float> st_m; static std::vector<float> st_am; static std::vector<float> st_av; static size_t st_t = 0;\n";
+                        opt_body += "    std::vector<float>& st_m = ctx->st_m_" + wt + "; std::vector<float>& st_am = ctx->st_am_" + wt + "; std::vector<float>& st_av = ctx->st_av_" + wt + "; size_t& st_t = ctx->st_t_" + wt + ";\n";
                         opt_body += "    size_t t = ++st_t;\n";
                         opt_body += "    if (st_m.size() != n_) { st_m.assign(n_, 0.f); st_am.assign(n_, 0.f); st_av.assign(n_, 0.f); }\n";
                         opt_body += "    float b1t = 1.f - std::pow(" + fmt_float(optim::kAdamWBeta1) + "f, (float)t), b2t = 1.f - std::pow(" + fmt_float(optim::kAdamWBeta2) + "f, (float)t);\n";
