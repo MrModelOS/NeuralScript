@@ -41,7 +41,7 @@ cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
 cmake --build build-asan -j && ctest --test-dir build-asan
 ```
 
-Installed (CPU) suite: 10 tests. Optional CUDA backend integration test —
+Installed (CPU) suite: 11 tests. Optional CUDA backend integration test —
 opt-in so plain `ctest` stays green on machines without a CUDA toolkit or GPU:
 
 ```sh
@@ -168,7 +168,7 @@ loss is the mean over the batch.
 | `src/optim`, `src/training` | Muon/AdamW reference optimizer, `NumericTrainer` |
 | `include/ns/optim/optim_params.hpp` | canonical optimizer hyperparameters (single source of truth) |
 | `include/ns/runtime/ns_runtime.h` | canonical C-ABI for hosts (training entry points) |
-| `tests/` | frontend + codegen + runtime + AOT-training integration tests (10) |
+| `tests/` | frontend + codegen + runtime + AOT-training integration tests (11) |
 
 ## License
 
