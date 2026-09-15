@@ -4,7 +4,7 @@ A small end-to-end compiler for a neural-network DSL: `network {...}` definition
 lower through a typed IR to standalone C++ inference kernels or self-contained
 C-ABI runtime drivers with **AOT-compiled training** (backward tape
 + Muon / AdamW weight updates) — no runtime graph, no Python-side numerics.
-*Version 1.2.0.*
+*Version 1.3.0.*
 
 ## Highlights
 
@@ -48,8 +48,32 @@ The forward pipeline now accepts the full feature-lowering stack beyond
 - `concat`/`transpose`/`reshape`/`slice`/`index`/`scatter` lower through the
   parser's function-call path (new instruction forms `ns.concat`,
   `ns.slice`, `ns.index`, `ns.scatter`, …), so they typecheck, fuse and
-  codegen like any other v1.2 head. Attention/embedding/layernorm/MoE are
-  forward-only in AOT training (backprop through them is deferred).
+  codegen like any other v1.2 head.
+
+## v1.3: AOT backprop through the v1.2 layers
+
+The `grad{}` lowering is no longer limited to `matmul + activation + dropout`.
+The reverse-mode scan now lowers the forward-only layers above to real
+gradient instructions, so they can be used in AOT training bodies:
+
+- **`LayerNorm()`** → `LAYERNORM_GRAD`: recomputed per-row `γ = mean((x−x̄)·d)`,
+  `dx = (d − d̄ − (x−x̄)·γ)·1/√(var+eps)` — verified by
+  `test_layernorm_train` (XOR + LayerNorm between layers converges to loss ~0,
+  4/4).
+- **`Embedding()`** → `EMBEDDING_GRAD_W`: scatter-add of `dOut` rows into
+  `dW` by the (non-differentiable) token index — verified by
+  `test_embedding_train` (token→class, 8/8).
+- **`MoE()`** → `MOE_GRAD_X` / `MOE_GRAD_WG` / `MOE_GRAD_WE`: each backward
+  kernel recomputes the fused routing (softmax over the top-1 expert, gate-grad
+  `p⊙(dp−Σp·dp)`, expert-grad `xᵀ⊗(p·d)`) — verified by `test_moe_train`
+  (2-expert token→class, 16/16).
+- All three have CPU (`ns_*_grad`) and CUDA kernels (`ns_*_grad_kernel`) and
+  forward cases in both `ns_train_core` CPU and CUDA emit, so the same train
+  body compiles for either backend. The optimizer steps on the MoE gate and
+  expert weights separately (`moe_g_w`, `moe_e_w`).
+- Attention backprop (dQ/dK/dV + softmax-grad + dWq/dWk/dWv/dWo) is the last
+  remaining forward-only layer; it lands with the end-to-end transformer train
+  test (emb→attn→ln→mlp→CE).
 
 Core tests: `test_transformer` (embedding→attention→layernorm vs a scalar
 reference), `test_datamove` (programmatic embedding→matmul→transpose→concat→
@@ -74,7 +98,7 @@ cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
 cmake --build build-asan -j && ctest --test-dir build-asan
 ```
 
-Installed (CPU) suite: 15 tests. Optional CUDA backend integration test —
+Installed (CPU) suite: 18 tests. Optional CUDA backend integration test —
 opt-in so plain `ctest` stays green on machines without a CUDA toolkit or GPU:
 
 ```sh
@@ -201,7 +225,7 @@ loss is the mean over the batch.
 | `src/optim`, `src/training` | Muon/AdamW reference optimizer, `NumericTrainer` |
 | `include/ns/optim/optim_params.hpp` | canonical optimizer hyperparameters (single source of truth) |
 | `include/ns/runtime/ns_runtime.h` | canonical C-ABI for hosts (training entry points) |
-| `tests/` | frontend + codegen + runtime + AOT-training integration tests (15) |
+| `tests/` | frontend + codegen + runtime + AOT-training integration tests (18) |
 
 ## License
 

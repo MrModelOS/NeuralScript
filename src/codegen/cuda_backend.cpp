@@ -313,6 +313,138 @@ __global__ void ns_act_grad_kernel(const float* __restrict__ dIn, const float* _
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < n) dOut[idx] = dIn[idx] * ns_act_deriv_d(actIn[idx], code);
 }
+__global__ void ns_layernorm_grad_kernel(const float* __restrict__ dout,
+                                         const float* __restrict__ x,
+                                         float* __restrict__ dx, int n, int last) {
+  int rows = n / last;
+  int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= rows) return;
+  float mean_x = 0.f, mean_dout = 0.f;
+  for (int j = 0; j < last; j++) {
+    mean_x    += x[r * last + j];
+    mean_dout += dout[r * last + j];
+  }
+  mean_x    /= last;
+  mean_dout /= last;
+  float var_x = 0.f, gamma = 0.f;
+  for (int j = 0; j < last; j++) {
+    float xj = x[r * last + j] - mean_x;
+    var_x += xj * xj;
+    gamma += xj * dout[r * last + j];
+  }
+  var_x /= last;
+  gamma /= last;
+  float inv = rsqrtf(var_x + 1e-5f);
+  for (int j = 0; j < last; j++) {
+    float xj = x[r * last + j] - mean_x;
+    dx[r * last + j] = (dout[r * last + j] - mean_dout - xj * gamma) * inv;
+  }
+}
+__global__ void ns_embedding_grad_w_kernel(const float* __restrict__ dout,
+                                           const float* __restrict__ idx,
+                                           float* __restrict__ dW,
+                                           int M, int emb_dim, int vocab_size) {
+  int t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < M * emb_dim) {
+    int row = t / emb_dim;
+    int col = t % emb_dim;
+    int tok = (int)idx[row];
+    if (tok >= 0 && tok < vocab_size)
+      atomicAdd(&dW[tok * emb_dim + col], dout[t]);
+  }
+}
+__global__ void ns_moe_grad_x_kernel(const float* __restrict__ dout, const float* __restrict__ x,
+                                     const float* __restrict__ Wg, const float* __restrict__ We,
+                                     float* __restrict__ dx, int M, int D, int E) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= M) return;
+  float g[256];
+  int Ee = E < 256 ? E : 256;
+  float mx = -1.0e30f;
+  for (int e = 0; e < Ee; e++) {
+    float a = 0.f;
+    for (int k = 0; k < D; k++) a += x[i * D + k] * Wg[k * E + e];
+    g[e] = a;
+    mx = fmaxf(mx, a);
+  }
+  float sum = 0.f;
+  for (int e = 0; e < Ee; e++) { g[e] = expf(g[e] - mx); sum += g[e]; }
+  int best = 0;
+  for (int e = 1; e < Ee; e++) if (g[e] > g[best]) best = e;
+  float pb = (sum > 0.f) ? g[best] / sum : 0.f;
+  float dpb = 0.f;
+  for (int j = 0; j < D; j++) {
+    float a = 0.f;
+    for (int k = 0; k < D; k++) a += x[i * D + k] * We[best * D * D + k * D + j];
+    dpb += a * dout[i * D + j];
+  }
+  float sd = dpb * pb;
+  for (int k = 0; k < D; k++) {
+    float gacc = 0.f, eacc = 0.f;
+    for (int e = 0; e < Ee; e++) {
+      float pe = (sum > 0.f) ? g[e] / sum : 0.f;
+      float dg = pe * ((e == best ? dpb : 0.f) - sd);
+      gacc += dg * Wg[k * E + e];
+    }
+    for (int j = 0; j < D; j++) eacc += We[best * D * D + k * D + j] * dout[i * D + j];
+    dx[i * D + k] = gacc + pb * eacc;
+  }
+}
+__global__ void ns_moe_grad_wg_kernel(const float* __restrict__ dout, const float* __restrict__ x,
+                                      const float* __restrict__ Wg, const float* __restrict__ We,
+                                      float* __restrict__ dWg, int M, int D, int E) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= M) return;
+  float g[256];
+  int Ee = E < 256 ? E : 256;
+  float mx = -1.0e30f;
+  for (int e = 0; e < Ee; e++) {
+    float a = 0.f;
+    for (int k = 0; k < D; k++) a += x[i * D + k] * Wg[k * E + e];
+    g[e] = a;
+    mx = fmaxf(mx, a);
+  }
+  float sum = 0.f;
+  for (int e = 0; e < Ee; e++) { g[e] = expf(g[e] - mx); sum += g[e]; }
+  int best = 0;
+  for (int e = 1; e < Ee; e++) if (g[e] > g[best]) best = e;
+  float pb = (sum > 0.f) ? g[best] / sum : 0.f;
+  float dpb = 0.f;
+  for (int j = 0; j < D; j++) {
+    float a = 0.f;
+    for (int k = 0; k < D; k++) a += x[i * D + k] * We[best * D * D + k * D + j];
+    dpb += a * dout[i * D + j];
+  }
+  float sd = dpb * pb;
+  for (int e = 0; e < Ee; e++) {
+    float pe = (sum > 0.f) ? g[e] / sum : 0.f;
+    float dg = pe * ((e == best ? dpb : 0.f) - sd);
+    for (int k = 0; k < D; k++) atomicAdd(&dWg[k * E + e], x[i * D + k] * dg);
+  }
+}
+__global__ void ns_moe_grad_we_kernel(const float* __restrict__ dout, const float* __restrict__ x,
+                                      const float* __restrict__ Wg, const float* __restrict__ We,
+                                      float* __restrict__ dWe, int M, int D, int E) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= M) return;
+  float g[256];
+  int Ee = E < 256 ? E : 256;
+  float mx = -1.0e30f;
+  for (int e = 0; e < Ee; e++) {
+    float a = 0.f;
+    for (int k = 0; k < D; k++) a += x[i * D + k] * Wg[k * E + e];
+    g[e] = a;
+    mx = fmaxf(mx, a);
+  }
+  float sum = 0.f;
+  for (int e = 0; e < Ee; e++) { g[e] = expf(g[e] - mx); sum += g[e]; }
+  int best = 0;
+  for (int e = 1; e < Ee; e++) if (g[e] > g[best]) best = e;
+  float pb = (sum > 0.f) ? g[best] / sum : 0.f;
+  for (int k = 0; k < D; k++)
+    for (int j = 0; j < D; j++)
+      atomicAdd(&dWe[best * D * D + k * D + j], x[i * D + k] * dout[i * D + j] * pb);
+}
 __global__ void ns_loss_grad_kernel(const float* __restrict__ preds, const float* __restrict__ labels,
                                     float* __restrict__ d, int numel, int C) {
   int rows = numel / C;

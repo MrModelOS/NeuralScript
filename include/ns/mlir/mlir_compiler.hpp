@@ -56,6 +56,17 @@ enum class MLIROp {
     LAYER_LAYERNORM,
     LAYER_MOE,
 
+    // Layer backward ops
+    LAYERNORM_GRAD,
+
+    // Embedding backward: scatter-add dOut rows into dW
+    EMBEDDING_GRAD_W,
+
+    // MoE backward: input / router-weight / expert-weight gradients
+    MOE_GRAD_X,
+    MOE_GRAD_WG,
+    MOE_GRAD_WE,
+
     // Storage
     ALLOC_BUFFER,      // allocate GPU buffer
     FREE_BUFFER,       // free GPU buffer

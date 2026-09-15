@@ -1132,6 +1132,138 @@ std::string CodeGenerator::gen_cpu(const MLIRModule& module, const CodegenOption
         << "  for (size_t i = 0; i < n; i++) dOut[i] = dIn[i] * ns_act_deriv(actInput[i], code);\n"
         << "}\n\n";
 
+    oss << "// LayerNorm backward: dx = (dout - mean(dout) - (x - mean_x) * mean((x-mean_x)*dout)) * inv\n"
+        << "static void ns_layernorm_grad(const float* dout, const float* x, float* dx,\n"
+        << "                               size_t numel, int64_t last) {\n"
+        << "  int64_t rows = (int64_t)numel / last;\n"
+        << "  for (int64_t r = 0; r < rows; r++) {\n"
+        << "    float mean_x = 0.f, mean_dout = 0.f;\n"
+        << "    for (int64_t j = 0; j < last; j++) {\n"
+        << "      mean_x   += x[(size_t)r*last + j];\n"
+        << "      mean_dout += dout[(size_t)r*last + j];\n"
+        << "    }\n"
+        << "    mean_x   /= last;\n"
+        << "    mean_dout /= last;\n"
+        << "    float var_x = 0.f, gamma = 0.f;\n"
+        << "    for (int64_t j = 0; j < last; j++) {\n"
+        << "      float xj = x[(size_t)r*last + j] - mean_x;\n"
+        << "      var_x += xj * xj;\n"
+        << "      gamma += xj * dout[(size_t)r*last + j];\n"
+        << "    }\n"
+        << "    var_x /= last;\n"
+        << "    gamma /= last;\n"
+        << "    float inv = 1.f / sqrtf(var_x + 1e-5f);\n"
+        << "    for (int64_t j = 0; j < last; j++) {\n"
+        << "      float xj = x[(size_t)r*last + j] - mean_x;\n"
+        << "      dx[(size_t)r*last + j] = (dout[(size_t)r*last + j] - mean_dout - xj * gamma) * inv;\n"
+        << "    }\n"
+        << "  }\n"
+        << "}\n\n";
+
+    oss << "// Embedding weight gradient: scatter-add dOut rows into dW[indices[i]].\n"
+        << "static void ns_embedding_grad_w(const float* dout, const float* idx, float* dW,\n"
+        << "                                size_t M, int64_t emb_dim, int64_t vocab_size) {\n"
+        << "  for (int64_t k = 0; k < vocab_size * emb_dim; k++) dW[k] = 0.f;\n"
+        << "  for (size_t i = 0; i < M; i++) {\n"
+        << "    int64_t row = (int64_t)idx[i];\n"
+        << "    if (row < 0 || row >= vocab_size) continue;\n"
+        << "    for (int64_t j = 0; j < emb_dim; j++)\n"
+        << "      dW[(size_t)row * emb_dim + j] += dout[(size_t)i * emb_dim + j];\n"
+        << "  }\n"
+        << "}\n\n";
+
+    oss << "// MoE backward: recompute router/expert routing and contribute to dx.\n"
+        << "static void ns_moe_grad_x(const float* dout, const float* x,\n"
+        << "                         const float* Wg, const float* We, float* dx,\n"
+        << "                         int64_t M, int64_t D, int64_t E) {\n"
+        << "  std::vector<float> lg((size_t)E), p((size_t)E);\n"
+        << "  for (int64_t i = 0; i < M; i++) {\n"
+        << "    float mx = -1.0e30f;\n"
+        << "    for (int64_t e = 0; e < E; e++) {\n"
+        << "      float a = 0.f;\n"
+        << "      for (int64_t k = 0; k < D; k++) a += x[i*D+k] * Wg[k*E+e];\n"
+        << "      lg[(size_t)e] = a;\n"
+        << "      if (a > mx) mx = a;\n"
+        << "    }\n"
+        << "    float sum = 0.f, pb = 0.f; int64_t best = 0;\n"
+        << "    for (int64_t e = 0; e < E; e++) { lg[(size_t)e] = expf(lg[(size_t)e] - mx); sum += lg[(size_t)e]; }\n"
+        << "    for (int64_t e = 1; e < E; e++) if (lg[(size_t)e] > lg[(size_t)best]) best = e;\n"
+        << "    if (sum > 0.f) { for (int64_t e = 0; e < E; e++) p[(size_t)e] = lg[(size_t)e] / sum; pb = p[(size_t)best]; }\n"
+        << "    float dpb = 0.f;\n"
+        << "    for (int64_t j = 0; j < D; j++) {\n"
+        << "      float a = 0.f;\n"
+        << "      for (int64_t k = 0; k < D; k++) a += x[i*D+k] * We[best*D*D + k*D + j];\n"
+        << "      dpb += a * dout[i*D+j];\n"
+        << "    }\n"
+        << "    float sd = dpb * pb;\n"
+        << "    for (int64_t e = 0; e < E; e++) {\n"
+        << "      float dg = p[(size_t)e] * ((e == best ? dpb : 0.f) - sd);\n"
+        << "      for (int64_t k = 0; k < D; k++) dx[i*D+k] += dg * Wg[k*E+e];\n"
+        << "    }\n"
+        << "    for (int64_t k = 0; k < D; k++) {\n"
+        << "      float acc = 0.f;\n"
+        << "      for (int64_t j = 0; j < D; j++) acc += We[best*D*D + k*D + j] * dout[i*D+j];\n"
+        << "      dx[i*D+k] += pb * acc;\n"
+        << "    }\n"
+        << "  }\n"
+        << "}\n\n";
+
+    oss << "// MoE router-weight gradient dWg[D,E]: dWg[k,e] += x[i,k] * dlg[i,e].\n"
+        << "static void ns_moe_grad_wg(const float* dout, const float* x,\n"
+        << "                           const float* Wg, const float* We, float* dWg,\n"
+        << "                           int64_t M, int64_t D, int64_t E) {\n"
+        << "  for (int64_t k = 0; k < D*E; k++) dWg[k] = 0.f;\n"
+        << "  std::vector<float> lg((size_t)E), p((size_t)E);\n"
+        << "  for (int64_t i = 0; i < M; i++) {\n"
+        << "    float mx = -1.0e30f;\n"
+        << "    for (int64_t e = 0; e < E; e++) {\n"
+        << "      float a = 0.f;\n"
+        << "      for (int64_t k = 0; k < D; k++) a += x[i*D+k] * Wg[k*E+e];\n"
+        << "      lg[(size_t)e] = a;\n"
+        << "      if (a > mx) mx = a;\n"
+        << "    }\n"
+        << "    float sum = 0.f, pb = 0.f; int64_t best = 0;\n"
+        << "    for (int64_t e = 0; e < E; e++) { lg[(size_t)e] = expf(lg[(size_t)e] - mx); sum += lg[(size_t)e]; }\n"
+        << "    for (int64_t e = 1; e < E; e++) if (lg[(size_t)e] > lg[(size_t)best]) best = e;\n"
+        << "    if (sum > 0.f) { for (int64_t e = 0; e < E; e++) p[(size_t)e] = lg[(size_t)e] / sum; pb = p[(size_t)best]; }\n"
+        << "    float dpb = 0.f;\n"
+        << "    for (int64_t j = 0; j < D; j++) {\n"
+        << "      float a = 0.f;\n"
+        << "      for (int64_t k = 0; k < D; k++) a += x[i*D+k] * We[best*D*D + k*D + j];\n"
+        << "      dpb += a * dout[i*D+j];\n"
+        << "    }\n"
+        << "    float sd = dpb * pb;\n"
+        << "    for (int64_t e = 0; e < E; e++) {\n"
+        << "      float dg = p[(size_t)e] * ((e == best ? dpb : 0.f) - sd);\n"
+        << "      for (int64_t k = 0; k < D; k++) dWg[k*E+e] += x[i*D+k] * dg;\n"
+        << "    }\n"
+        << "  }\n"
+        << "}\n\n";
+
+    oss << "// MoE expert-weight gradient dWe[E,D,D]: dWe[best,:,:] += x^T @ dz.\n"
+        << "static void ns_moe_grad_we(const float* dout, const float* x,\n"
+        << "                           const float* Wg, const float* We, float* dWe,\n"
+        << "                           int64_t M, int64_t D, int64_t E) {\n"
+        << "  for (int64_t k = 0; k < (int64_t)E*D*D; k++) dWe[k] = 0.f;\n"
+        << "  std::vector<float> lg((size_t)E), p((size_t)E);\n"
+        << "  for (int64_t i = 0; i < M; i++) {\n"
+        << "    float mx = -1.0e30f;\n"
+        << "    for (int64_t e = 0; e < E; e++) {\n"
+        << "      float a = 0.f;\n"
+        << "      for (int64_t k = 0; k < D; k++) a += x[i*D+k] * Wg[k*E+e];\n"
+        << "      lg[(size_t)e] = a;\n"
+        << "      if (a > mx) mx = a;\n"
+        << "    }\n"
+        << "    float sum = 0.f, pb = 0.f; int64_t best = 0;\n"
+        << "    for (int64_t e = 0; e < E; e++) { lg[(size_t)e] = expf(lg[(size_t)e] - mx); sum += lg[(size_t)e]; }\n"
+        << "    for (int64_t e = 1; e < E; e++) if (lg[(size_t)e] > lg[(size_t)best]) best = e;\n"
+        << "    if (sum > 0.f) pb = lg[(size_t)best] / sum;\n"
+        << "    for (int64_t k = 0; k < D; k++)\n"
+        << "      for (int64_t j = 0; j < D; j++)\n"
+        << "        dWe[best*D*D + k*D + j] += x[i*D+k] * dout[i*D+j] * pb;\n"
+        << "  }\n"
+        << "}\n\n";
+
     oss << "// dL/d(preds) = (softmax(preds) - labels) / B   (cross-entropy seed)\n"
         << "static void ns_loss_grad(const float* preds, const float* labels, float* d,\n"
         << "                         size_t numel, int64_t C) {\n"
@@ -1753,11 +1885,14 @@ std::string CodeGenerator::gen_cpu(const MLIRModule& module, const CodegenOption
                 }
                 for (auto& ins : tfn_->instructions)
                     for (auto& op : ins.operands) sc.emplace(std::make_pair(op, IX()));
-                // Mirror emit_train_core's runtime I/O detection: the first
-                // non-weight GEMM A (batch features) and the CE label operand
-                // are passed in as raw pointers, never stored in the context.
+                // Mirror emit_train_core's runtime I/O detection: the raw data inputs
+                // (first GEMM A, or an embedding index stream) and the CE label
+                // operand are passed in as raw pointers, never stored in context.
                 string xid_, yid_;
                 for (auto& ins : tfn_->instructions) {
+                    if (ins.op == MLIROp::LAYER_EMBEDDING && ins.operands.size() >= 2 &&
+                        !sc[ins.operands[1]].is_weight && xid_.empty())
+                        xid_ = ins.operands[1];
                     if (ins.op == MLIROp::MATMUL && ins.operands.size() >= 2 &&
                         !sc[ins.operands[0]].is_weight && xid_.empty())
                         xid_ = ins.operands[0];
@@ -1908,9 +2043,14 @@ std::string CodeGenerator::emit_train_core(const MLIRFunction& tfn, int64_t in_c
         for (auto& op : instr.operands)
             if (!ids.count(op)) ids[op] = IdInfo();
 
-    // Detect the two dynamic inputs: batch_x (first GEMM A) and batch_y (CE labels).
+    // Detect the two dynamic inputs: batch_x (first GEMM A or embedding index
+    // stream) and batch_y (CE labels). For embedding-first networks the raw
+    // input feeds LAYER_EMBEDDING's index operand, not a GEMM.
     string x_id, y_id;
     for (auto& instr : tfn.instructions) {
+        if (instr.op == MLIROp::LAYER_EMBEDDING && instr.operands.size() >= 2 &&
+            !ids[instr.operands[1]].is_weight && x_id.empty())
+            x_id = instr.operands[1];
         if (instr.op == MLIROp::MATMUL && instr.operands.size() >= 2 &&
             !ids[instr.operands[0]].is_weight && x_id.empty())
             x_id = instr.operands[0];
@@ -1929,6 +2069,40 @@ std::string CodeGenerator::emit_train_core(const MLIRFunction& tfn, int64_t in_c
     };
     auto numel_of = [&](const string& id) -> string {
         return id == x_id ? string("nx") : ("buf_" + id + ".size()");
+    };
+
+    // Column-width propagation (mirrors CUDA wcols): forwards widths from
+    // statically typed operands / weights through the instruction graph so
+    // layernorm_grad (and future ops needing the column dim) get the right
+    // value when result_type is not set on intermediate ops (e.g. RELU).
+    map<string, int64_t> wcols;
+    {
+        for (auto& instr : tfn.instructions) {
+            string ida = instr.result_id;
+            for (auto& op : instr.operands) {
+                auto it = ids.find(op);
+                if (it != ids.end() && it->second.cols > 0) wcols[op] = it->second.cols;
+            }
+            if ((instr.op == MLIROp::MATMUL || instr.op == MLIROp::FUSED) &&
+                instr.operands.size() >= 2) {
+                auto it = ids.find(instr.operands[1]);
+                if (it != ids.end() && it->second.cols > 0) wcols[ida] = it->second.cols;
+            } else if (!ida.empty() && !instr.operands.empty()) {
+                auto it = wcols.find(instr.operands[0]);
+                if (it != wcols.end() && it->second > 0) wcols[ida] = it->second;
+            }
+        }
+    }
+    auto train_row_dims = [&](const string& v) -> int64_t {
+        if (!v.empty()) {
+            auto wc = wcols.find(v);
+            if (wc != wcols.end() && wc->second > 0) return wc->second;
+        }
+        if (!v.empty()) {
+            auto it = ids.find(v);
+            if (it != ids.end() && it->second.cols > 0) return it->second.cols;
+        }
+        return 1;
     };
 
     ostringstream oss;
@@ -1991,6 +2165,43 @@ std::string CodeGenerator::emit_train_core(const MLIRFunction& tfn, int64_t in_c
                 fwd_body += "    buf_" + id + ".resize(zn);\n";
                 fwd_body += "    const float* src = " + src_of(in) + ";\n";
                 fwd_body += "    for (size_t i = 0; i < zn; i++) buf_" + id + "[i] = ns_act2(src[i], " + to_string(code) + "); }\n";
+                break;
+            }
+            case MLIROp::LAYER_EMBEDDING: {
+                string wt = instr.operands.size() > 0 ? instr.operands[0] : "";
+                string idx = instr.operands.size() > 1 ? instr.operands[1] : "";
+                int64_t V = ids[wt].rows > 0 ? ids[wt].rows : 1;
+                int64_t D = ids[wt].cols > 0 ? ids[wt].cols : 1;
+                fwd_body += "  { int64_t n_idx = " + numel_of(idx) + ";\n";
+                fwd_body += "    buf_" + id + ".resize((size_t)(n_idx * " + to_string(D) + "));\n";
+                fwd_body += "    ns_embedding(" + src_of(wt) + ", " + src_of(idx) + ", buf_" +
+                            id + ".data(), n_idx, " + to_string(V) + ", " + to_string(D) + "); }\n";
+                break;
+            }
+            case MLIROp::LAYER_MOE: {
+                string x = instr.operands.size() > 0 ? instr.operands[0] : "";
+                string Wg = instr.operands.size() > 1 ? instr.operands[1] : "";
+                string We = instr.operands.size() > 2 ? instr.operands[2] : "";
+                int64_t D = instr.int_attr > 0 ? instr.int_attr : 1;
+                int64_t E = instr.attribute.empty() ? 4 : std::atol(instr.attribute.c_str());
+                fwd_body += "  { int64_t M = (int64_t)(" + numel_of(x) + ") / " + to_string(D) + ";\n";
+                fwd_body += "    buf_" + id + ".resize((size_t)(M * " + to_string(D) + "));\n";
+                fwd_body += "    ns_moe_fwd(" + src_of(x) + ", " + src_of(Wg) + ", " + src_of(We) +
+                            ", buf_" + id + ".data(), M, " + to_string(D) + ", " + to_string(E) + "); }\n";
+                break;
+            }
+            case MLIROp::LAYERNORM: case MLIROp::SOFTMAX: {
+                string in = instr.operands.size() > 0 ? instr.operands[0] : "";
+                int64_t last = train_row_dims(in);
+                last = last > 0 ? last : 1;
+                fwd_body += "  { size_t zn = " + numel_of(in) + ";\n";
+                fwd_body += "    buf_" + id + ".resize(zn);\n";
+                fwd_body += "    const float* src = " + src_of(in) + ";\n";
+                fwd_body += "    for (size_t i = 0; i < zn; i++) buf_" + id + "[i] = src[i];\n";
+                if (instr.op == MLIROp::LAYERNORM)
+                    fwd_body += "    ns_layernorm(buf_" + id + ".data(), buf_" + id + ".size(), " + to_string(last) + "); }\n";
+                else
+                    fwd_body += "    ns_softmax(buf_" + id + ".data(), buf_" + id + ".size(), " + to_string(last) + "); }\n";
                 break;
             }
             case MLIROp::DROPOUT: {
@@ -2057,6 +2268,69 @@ std::string CodeGenerator::emit_train_core(const MLIRFunction& tfn, int64_t in_c
                 train_body += "    buf_" + id + ".resize((size_t)(K * N));\n";
                 train_body += "    ns_matmul_grad_w(" + src_of(A) + ", buf_" + dc + ".data(), buf_" +
                               id + ".data(), M, K, N); }\n";
+                break;
+            }
+            case MLIROp::EMBEDDING_GRAD_W: {
+                string dout = instr.operands.size() > 0 ? instr.operands[0] : "";
+                string idx = instr.operands.size() > 1 ? instr.operands[1] : "";
+                string wt = instr.operands.size() > 2 ? instr.operands[2] : "";
+                int64_t V = ids[wt].rows > 0 ? ids[wt].rows : 1;
+                int64_t D = ids[wt].cols > 0 ? ids[wt].cols : 1;
+                train_body += "  { size_t M = buf_" + dout + ".size() / " + to_string(D) + ";\n";
+                train_body += "    buf_" + id + ".resize((size_t)(" + to_string(V) + " * " + to_string(D) + "));\n";
+                train_body += "    ns_embedding_grad_w(buf_" + dout + ".data(), " + src_of(idx) + ", buf_" +
+                              id + ".data(), M, " + to_string(D) + ", " + to_string(V) + "); }\n";
+                break;
+            }
+            case MLIROp::MOE_GRAD_X: {
+                string dout = instr.operands.size() > 0 ? instr.operands[0] : "";
+                string xo = instr.operands.size() > 1 ? instr.operands[1] : "";
+                string Wg = instr.operands.size() > 2 ? instr.operands[2] : "";
+                string We = instr.operands.size() > 3 ? instr.operands[3] : "";
+                int64_t D = instr.int_attr > 0 ? instr.int_attr : 1;
+                int64_t E = instr.attribute.empty() ? 4 : std::atol(instr.attribute.c_str());
+                train_body += "  { int64_t M = (int64_t)(buf_" + dout + ".size()) / " + to_string(D) + ";\n";
+                train_body += "    buf_" + id + ".resize((size_t)(M * " + to_string(D) + "));\n";
+                train_body += "    for (size_t q = 0; q < buf_" + id + ".size(); q++) buf_" + id + "[q] = 0.f;\n";
+                train_body += "    ns_moe_grad_x(buf_" + dout + ".data(), " + src_of(xo) + ", " + src_of(Wg) +
+                              ", " + src_of(We) + ", buf_" + id + ".data(), M, " + to_string(D) + ", " + to_string(E) + "); }\n";
+                break;
+            }
+            case MLIROp::MOE_GRAD_WG: {
+                string dout = instr.operands.size() > 0 ? instr.operands[0] : "";
+                string xo = instr.operands.size() > 1 ? instr.operands[1] : "";
+                string Wg = instr.operands.size() > 2 ? instr.operands[2] : "";
+                string We = instr.operands.size() > 3 ? instr.operands[3] : "";
+                int64_t D = instr.int_attr > 0 ? instr.int_attr : 1;
+                int64_t E = instr.attribute.empty() ? 4 : std::atol(instr.attribute.c_str());
+                train_body += "  { int64_t M = (int64_t)(buf_" + dout + ".size()) / " + to_string(D) + ";\n";
+                train_body += "    buf_" + id + ".resize((size_t)(" + to_string(D) + " * " + to_string(E) + "));\n";
+                train_body += "    ns_moe_grad_wg(buf_" + dout + ".data(), " + src_of(xo) + ", " + src_of(Wg) +
+                              ", " + src_of(We) + ", buf_" + id + ".data(), M, " + to_string(D) + ", " + to_string(E) + "); }\n";
+                break;
+            }
+            case MLIROp::MOE_GRAD_WE: {
+                string dout = instr.operands.size() > 0 ? instr.operands[0] : "";
+                string xo = instr.operands.size() > 1 ? instr.operands[1] : "";
+                string Wg = instr.operands.size() > 2 ? instr.operands[2] : "";
+                string We = instr.operands.size() > 3 ? instr.operands[3] : "";
+                int64_t D = instr.int_attr > 0 ? instr.int_attr : 1;
+                int64_t E = instr.attribute.empty() ? 4 : std::atol(instr.attribute.c_str());
+                train_body += "  { int64_t M = (int64_t)(buf_" + dout + ".size()) / " + to_string(D) + ";\n";
+                train_body += "    buf_" + id + ".resize((size_t)(" + to_string(E) + " * " + to_string(D) + " * " + to_string(D) + "));\n";
+                train_body += "    ns_moe_grad_we(buf_" + dout + ".data(), " + src_of(xo) + ", " + src_of(Wg) +
+                              ", " + src_of(We) + ", buf_" + id + ".data(), M, " + to_string(D) + ", " + to_string(E) + "); }\n";
+                break;
+            }
+            case MLIROp::LAYERNORM_GRAD: {
+                string dout = instr.operands.size() > 0 ? instr.operands[0] : "";
+                string act_in = instr.operands.size() > 1 ? instr.operands[1] : "";
+                int64_t last = train_row_dims(act_in);
+                last = last > 0 ? last : 1;
+                train_body += "  { size_t zn = buf_" + dout + ".size();\n";
+                train_body += "    buf_" + id + ".resize(zn);\n";
+                train_body += "    ns_layernorm_grad(buf_" + dout + ".data(), buf_" + act_in +
+                              ".data(), buf_" + id + ".data(), zn, " + to_string(last) + "); }\n";
                 break;
             }
             case MLIROp::ACTIVATION_GRAD: {
@@ -2166,6 +2440,9 @@ std::string CodeGenerator::emit_train_core_cuda(const MLIRFunction& tfn,
     // batch_y (CE labels).
     string x_id, y_id;
     for (auto& instr : tfn.instructions) {
+        if (instr.op == MLIROp::LAYER_EMBEDDING && instr.operands.size() >= 2 &&
+            !ids[instr.operands[1]].is_weight && x_id.empty())
+            x_id = instr.operands[1];
         if (instr.op == MLIROp::MATMUL && instr.operands.size() >= 2 &&
             !ids[instr.operands[0]].is_weight && x_id.empty())
             x_id = instr.operands[0];
@@ -2287,6 +2564,46 @@ std::string CodeGenerator::emit_train_core_cuda(const MLIRFunction& tfn,
                     + cu_act_code(instr.op) + ");\n";
                 break;
             }
+            case MLIROp::LAYER_EMBEDDING: {
+                string wt = instr.operands.size() > 0 ? instr.operands[0] : "";
+                string idx = instr.operands.size() > 1 ? instr.operands[1] : "";
+                int64_t V = ids[wt].rows > 0 ? ids[wt].rows : 1;
+                int64_t D = ids[wt].cols > 0 ? ids[wt].cols : 1;
+                fwd_text += "  if (ns_cu_reserve(&ctx->d_" + id + ", &ctx->d_" + id + "_cap, (size_t)M * "
+                    + to_string(D) + " * sizeof(float), 0)) return;\n";
+                fwd_text += "  NS_LAUNCH1(ns_embedding_kernel, M * " + to_string(D) + ", "
+                    + bufv(wt) + ", " + bufv(idx) + ", ctx->d_" + id + ", M, "
+                    + to_string(V) + ", " + to_string(D) + ");\n";
+                break;
+            }
+            case MLIROp::LAYER_MOE: {
+                string x = instr.operands.size() > 0 ? instr.operands[0] : "";
+                string Wg = instr.operands.size() > 1 ? instr.operands[1] : "";
+                string We = instr.operands.size() > 2 ? instr.operands[2] : "";
+                int64_t D = instr.int_attr > 0 ? instr.int_attr : 1;
+                int64_t E = instr.attribute.empty() ? 4 : std::atol(instr.attribute.c_str());
+                fwd_text += "  if (ns_cu_reserve(&ctx->d_" + id + ", &ctx->d_" + id + "_cap, (size_t)(M * "
+                    + to_string(D) + ") * sizeof(float), 0)) return;\n";
+                fwd_text += "  NS_LAUNCH_BLOCKS(ns_moe_kernel, M, "
+                    + bufv(x) + ", " + bufv(Wg) + ", " + bufv(We) + ", ctx->d_" + id + ", "
+                    + "M, " + to_string(D) + ", " + to_string(E) + ");\n";
+                break;
+            }
+            case MLIROp::LAYERNORM: case MLIROp::SOFTMAX: {
+                string in = instr.operands.size() > 0 ? instr.operands[0] : "";
+                int64_t Ns = row_dims(in);
+                Ns = Ns > 0 ? Ns : 1;
+                string kn = "M * " + to_string(Ns);
+                fwd_text += "  if (ns_cu_reserve(&ctx->d_" + id + ", &ctx->d_" + id + "_cap, (size_t)(" + kn
+                    + ") * sizeof(float), 0)) return;\n";
+                fwd_text += "  NS_LAUNCH1(ns_copy_kernel, " + kn + ", "
+                    + bufv(in) + ", ctx->d_" + id + ", " + kn + ");\n";
+                if (instr.op == MLIROp::LAYERNORM)
+                    fwd_text += "  NS_LAUNCH1(ns_layernorm_kernel, M, ctx->d_" + id + ", " + kn + ", " + to_string(Ns) + ");\n";
+                else
+                    fwd_text += "  NS_LAUNCH1(ns_softmax_kernel, M, ctx->d_" + id + ", " + kn + ", " + to_string(Ns) + ");\n";
+                break;
+            }
             case MLIROp::DROPOUT: {
                 string in = instr.operands.size() > 0 ? instr.operands[0] : "";
                 int64_t Ns = row_dims(in);
@@ -2359,6 +2676,80 @@ std::string CodeGenerator::emit_train_core_cuda(const MLIRFunction& tfn,
                 train_text += "  NS_LAUNCH1(ns_grad_w_kernel, " + to_string(n) + ", "
                     + bufv(A) + ", " + bufv(dc) + ", ctx->d_" + id + ", M, "
                     + to_string(Ks) + ", " + to_string(Ns) + ");\n";
+                break;
+            }
+            case MLIROp::EMBEDDING_GRAD_W: {
+                string dout = instr.operands.size() > 0 ? instr.operands[0] : "";
+                string idx = instr.operands.size() > 1 ? instr.operands[1] : "";
+                string wt = instr.operands.size() > 2 ? instr.operands[2] : "";
+                int64_t V = ids[wt].rows > 0 ? ids[wt].rows : 1;
+                int64_t D = ids[wt].cols > 0 ? ids[wt].cols : 1;
+                int64_t n = V * D;
+                train_text += "  if (ns_cu_reserve(&ctx->d_" + id + ", &ctx->d_" + id + "_cap, "
+                    + to_string(n) + " * sizeof(float), 0)) return;\n";
+                train_text += "  NS_LAUNCH1(ns_fill_kernel, " + to_string(n) + ", ctx->d_" + id
+                    + ", " + to_string(n) + ", 0.0f);\n";
+                train_text += "  NS_LAUNCH1(ns_embedding_grad_w_kernel, M * " + to_string(D) + ", "
+                    + bufv(dout) + ", " + bufv(idx) + ", ctx->d_" + id + ", M, "
+                    + to_string(D) + ", " + to_string(V) + ");\n";
+                break;
+            }
+            case MLIROp::MOE_GRAD_X: {
+                string dout = instr.operands.size() > 0 ? instr.operands[0] : "";
+                string xo = instr.operands.size() > 1 ? instr.operands[1] : "";
+                string Wg = instr.operands.size() > 2 ? instr.operands[2] : "";
+                string We = instr.operands.size() > 3 ? instr.operands[3] : "";
+                int64_t D = instr.int_attr > 0 ? instr.int_attr : 1;
+                int64_t E = instr.attribute.empty() ? 4 : std::atol(instr.attribute.c_str());
+                train_text += "  if (ns_cu_reserve(&ctx->d_" + id + ", &ctx->d_" + id + "_cap, (size_t)M * "
+                    + to_string(D) + " * sizeof(float), 0)) return;\n";
+                train_text += "  NS_LAUNCH_BLOCKS(ns_moe_grad_x_kernel, M, "
+                    + bufv(dout) + ", " + bufv(xo) + ", " + bufv(Wg) + ", " + bufv(We)
+                    + ", ctx->d_" + id + ", M, " + to_string(D) + ", " + to_string(E) + ");\n";
+                break;
+            }
+            case MLIROp::MOE_GRAD_WG: {
+                string dout = instr.operands.size() > 0 ? instr.operands[0] : "";
+                string xo = instr.operands.size() > 1 ? instr.operands[1] : "";
+                string Wg = instr.operands.size() > 2 ? instr.operands[2] : "";
+                string We = instr.operands.size() > 3 ? instr.operands[3] : "";
+                int64_t D = instr.int_attr > 0 ? instr.int_attr : 1;
+                int64_t E = instr.attribute.empty() ? 4 : std::atol(instr.attribute.c_str());
+                string nwg = to_string(D) + " * " + to_string(E);
+                train_text += "  if (ns_cu_reserve(&ctx->d_" + id + ", &ctx->d_" + id + "_cap, (size_t)("
+                    + nwg + ") * sizeof(float), 0)) return;\n";
+                train_text += "  NS_LAUNCH1(ns_fill_kernel, " + nwg + ", ctx->d_" + id + ", " + nwg + ", 0.0f);\n";
+                train_text += "  NS_LAUNCH_BLOCKS(ns_moe_grad_wg_kernel, M, "
+                    + bufv(dout) + ", " + bufv(xo) + ", " + bufv(Wg) + ", " + bufv(We)
+                    + ", ctx->d_" + id + ", M, " + to_string(D) + ", " + to_string(E) + ");\n";
+                break;
+            }
+            case MLIROp::MOE_GRAD_WE: {
+                string dout = instr.operands.size() > 0 ? instr.operands[0] : "";
+                string xo = instr.operands.size() > 1 ? instr.operands[1] : "";
+                string Wg = instr.operands.size() > 2 ? instr.operands[2] : "";
+                string We = instr.operands.size() > 3 ? instr.operands[3] : "";
+                int64_t D = instr.int_attr > 0 ? instr.int_attr : 1;
+                int64_t E = instr.attribute.empty() ? 4 : std::atol(instr.attribute.c_str());
+                string nwe = to_string(E) + " * " + to_string(D) + " * " + to_string(D);
+                train_text += "  if (ns_cu_reserve(&ctx->d_" + id + ", &ctx->d_" + id + "_cap, (size_t)("
+                    + nwe + ") * sizeof(float), 0)) return;\n";
+                train_text += "  NS_LAUNCH1(ns_fill_kernel, " + nwe + ", ctx->d_" + id + ", " + nwe + ", 0.0f);\n";
+                train_text += "  NS_LAUNCH_BLOCKS(ns_moe_grad_we_kernel, M, "
+                    + bufv(dout) + ", " + bufv(xo) + ", " + bufv(Wg) + ", " + bufv(We)
+                    + ", ctx->d_" + id + ", M, " + to_string(D) + ", " + to_string(E) + ");\n";
+                break;
+            }
+            case MLIROp::LAYERNORM_GRAD: {
+                string dout = instr.operands.size() > 0 ? instr.operands[0] : "";
+                string act_in = instr.operands.size() > 1 ? instr.operands[1] : "";
+                int64_t Ns = row_dims(act_in);
+                Ns = Ns > 0 ? Ns : 1;
+                train_text += "  if (ns_cu_reserve(&ctx->d_" + id + ", &ctx->d_" + id + "_cap, (size_t)M * "
+                    + to_string(Ns) + " * sizeof(float), 0)) return;\n";
+                train_text += "  NS_LAUNCH1(ns_layernorm_grad_kernel, M, "
+                    + bufv(dout) + ", " + bufv(act_in) + ", ctx->d_" + id + ", M * "
+                    + to_string(Ns) + ", " + to_string(Ns) + ");\n";
                 break;
             }
             case MLIROp::ACTIVATION_GRAD: {

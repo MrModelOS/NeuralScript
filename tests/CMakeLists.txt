@@ -76,6 +76,27 @@ target_compile_definitions(test_aot_train PRIVATE
 add_test(NAME test_aot_train COMMAND test_aot_train)
 set_tests_properties(test_aot_train PROPERTIES TIMEOUT 120)
 
+add_executable(test_layernorm_train test_layernorm_train.cpp)
+target_link_libraries(test_layernorm_train ns_core)
+target_compile_definitions(test_layernorm_train PRIVATE
+    NS_REPO_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../include")
+add_test(NAME test_layernorm_train COMMAND test_layernorm_train)
+set_tests_properties(test_layernorm_train PROPERTIES TIMEOUT 120)
+
+add_executable(test_embedding_train test_embedding_train.cpp)
+target_link_libraries(test_embedding_train ns_core)
+target_compile_definitions(test_embedding_train PRIVATE
+    NS_REPO_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../include")
+add_test(NAME test_embedding_train COMMAND test_embedding_train)
+set_tests_properties(test_embedding_train PROPERTIES TIMEOUT 120)
+
+add_executable(test_moe_train test_moe_train.cpp)
+target_link_libraries(test_moe_train ns_core)
+target_compile_definitions(test_moe_train PRIVATE
+    NS_REPO_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../include")
+add_test(NAME test_moe_train COMMAND test_moe_train)
+set_tests_properties(test_moe_train PROPERTIES TIMEOUT 120)
+
 # CUDA backend integration is opt-in: adding it unconditionally would make
 # ctest FAIL/hang on machines without the CUDA toolkit or a device. With
 # -DNS_ENABLE_CUDA=ON the test compiles the emitted .cu with nvcc (if present)

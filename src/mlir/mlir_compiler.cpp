@@ -312,10 +312,21 @@ void MLIRCompiler::compile_stmt(Stmt* stmt, MLIRFunction& fn) {
                         g[i.operands[1]] = iw.result_id;
                         break;
                     }
+                    case MLIROp::LAYERNORM: case MLIROp::LAYER_LAYERNORM: {
+                        auto cit = g.find(i.result_id);
+                        if (cit == g.end() || i.operands.empty()) break;
+                        auto lg = MLIRInstr(MLIROp::LAYERNORM_GRAD, new_temp("g"));
+                        lg.operands = {cit->second, i.operands[0]};
+                        lg.attribute = activation_name(i.op);
+                        lg.comment = "d" + i.operands[0] + " = layernorm_grad(d" + i.result_id + ", " + i.operands[0] + ")";
+                        fn.instructions.push_back(lg);
+                        g[i.operands[0]] = lg.result_id;
+                        break;
+                    }
                     case MLIROp::RELU: case MLIROp::LEAKY_RELU: case MLIROp::SIGMOID:
                     case MLIROp::TANH: case MLIROp::SWISH: case MLIROp::GELU:
                     case MLIROp::SILU: case MLIROp::IDENTITY:
-                    case MLIROp::SOFTMAX: case MLIROp::LAYERNORM: {
+                    case MLIROp::SOFTMAX: {
                         auto cit = g.find(i.result_id);
                         if (cit == g.end() || i.operands.empty()) break;
                         auto ig = MLIRInstr(MLIROp::ACTIVATION_GRAD, new_temp("g"));
@@ -339,6 +350,46 @@ void MLIRCompiler::compile_stmt(Stmt* stmt, MLIRFunction& fn) {
                                      " * dropout_mask";
                         fn.instructions.push_back(ig);
                         g[i.operands[0]] = ig.result_id;
+                        break;
+                    }
+                    case MLIROp::LAYER_EMBEDDING: {
+                        auto cit = g.find(i.result_id);
+                        if (cit == g.end() || i.operands.size() < 2) break;
+                        // Embedding backward: scatter-add dOut rows into dW[indices].
+                        // No gradient flows to the indices input (non-differentiable).
+                        auto wg = MLIRInstr(MLIROp::EMBEDDING_GRAD_W, new_temp("g"));
+                        wg.operands = {cit->second, i.operands[1], i.operands[0]};
+                        wg.comment = "d" + i.operands[0] + " = scatter_add(d" + i.result_id + ")";
+                        fn.instructions.push_back(wg);
+                        g[i.operands[0]] = wg.result_id;
+                        break;
+                    }
+                    case MLIROp::LAYER_MOE: {
+                        auto cit = g.find(i.result_id);
+                        if (cit == g.end() || i.operands.size() < 3) break;
+                        std::string E = i.attribute.empty() ? "4" : i.attribute;
+                        std::string D = std::to_string(i.int_attr);
+                        // dx (gate path + routed expert path)
+                        auto mx = MLIRInstr(MLIROp::MOE_GRAD_X, new_temp("g"));
+                        mx.operands = {cit->second, i.operands[0], i.operands[1], i.operands[2]};
+                        mx.attribute = E; mx.int_attr = i.int_attr;
+                        mx.comment = "dx(moe)";
+                        fn.instructions.push_back(mx);
+                        g[i.operands[0]] = mx.result_id;
+                        // dWg (router weights)
+                        auto mg = MLIRInstr(MLIROp::MOE_GRAD_WG, new_temp("g"));
+                        mg.operands = mx.operands;
+                        mg.attribute = E; mg.int_attr = i.int_attr;
+                        mg.comment = "dWg(moe)";
+                        fn.instructions.push_back(mg);
+                        g[i.operands[1]] = mg.result_id;
+                        // dWe (expert weights)
+                        auto me = MLIRInstr(MLIROp::MOE_GRAD_WE, new_temp("g"));
+                        me.operands = mx.operands;
+                        me.attribute = E; me.int_attr = i.int_attr;
+                        me.comment = "dWe(moe)";
+                        fn.instructions.push_back(me);
+                        g[i.operands[2]] = me.result_id;
                         break;
                     }
                     default:
@@ -729,10 +780,6 @@ void MLIRCompiler::apply_pipeline_stage(const std::string& wname, MLIRValue& in,
             return;
         }
         if (ty == "Embedding") {
-            if (is_train_fn)
-                throw std::runtime_error(
-                    "AOT backprop through Embedding is not implemented yet; "
-                    "use the layer in forward() only");
             auto wit = layer_weight_id_.find(wname);
             std::string wid = wit != layer_weight_id_.end() ? wit->second : wname;
             auto instr = MLIRInstr(MLIROp::LAYER_EMBEDDING, new_temp("emb"));
@@ -746,9 +793,6 @@ void MLIRCompiler::apply_pipeline_stage(const std::string& wname, MLIRValue& in,
             return;
         }
         if (ty == "LayerNorm" || ty == "Normalize") {
-            if (is_train_fn)
-                throw std::runtime_error(
-                    "AOT backprop through LayerNorm is not implemented yet");
             auto instr = MLIRInstr(MLIROp::LAYERNORM, new_temp("ln"));
             instr.operands = {in.id};
             instr.result_type = in.type;
@@ -784,10 +828,6 @@ void MLIRCompiler::apply_pipeline_stage(const std::string& wname, MLIRValue& in,
             return;
         }
         if (ty == "MoE" || ty == "MixtureOfExperts") {
-            if (is_train_fn)
-                throw std::runtime_error(
-                    "AOT backprop through MoE is not implemented yet; "
-                    "use the layer in forward() only");
             if (miter->second.weight_ids.size() < 2)
                 throw std::runtime_error(
                     "MoE layer '" + wname +
@@ -873,6 +913,11 @@ std::string MLIRCompiler::dump(MLIRModule& module) {
                 case MLIROp::DROPOUT: oss << "ns.dropout"; break;
                 case MLIROp::LAYERNORM: oss << "ns.layernorm"; break;
                 case MLIROp::CROSS_ENTROPY: oss << "ns.cross_entropy"; break;
+                case MLIROp::LAYERNORM_GRAD: oss << "ns.grad.layernorm"; break;
+                case MLIROp::EMBEDDING_GRAD_W: oss << "ns.grad.embedding.w"; break;
+                case MLIROp::MOE_GRAD_X: oss << "ns.grad.moe.x"; break;
+                case MLIROp::MOE_GRAD_WG: oss << "ns.grad.moe.wg"; break;
+                case MLIROp::MOE_GRAD_WE: oss << "ns.grad.moe.we"; break;
                 case MLIROp::MATMUL_GRAD_A: oss << "ns.grad.matmul.a"; break;
                 case MLIROp::MATMUL_GRAD_W: oss << "ns.grad.matmul.w"; break;
                 case MLIROp::ACTIVATION_GRAD: oss << "ns.grad.activation"; break;
