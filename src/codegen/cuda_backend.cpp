@@ -90,6 +90,164 @@ __global__ void ns_fill_kernel(float* __restrict__ out, int n, float v) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < n) out[idx] = v;
 }
+__global__ void ns_transpose2d_kernel(const float* __restrict__ in, float* __restrict__ out,
+                                      int rows, int cols) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = rows * cols;
+  if (idx >= total) return;
+  int i = idx / cols, j = idx - i * cols;
+  out[j * rows + i] = in[i * cols + j];
+}
+__global__ void ns_concat2_kernel(const float* __restrict__ A, const float* __restrict__ B,
+                                  float* __restrict__ out, int rows, int ca, int co) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = rows * co;
+  if (idx >= total) return;
+  int r = idx / co, c = idx - r * co;
+  out[idx] = (c < ca) ? A[r * ca + c] : B[r * (co - ca) + (c - ca)];
+}
+__global__ void ns_concat0_kernel(const float* __restrict__ A, const float* __restrict__ B,
+                                  float* __restrict__ out, int na, int nb, int D) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = (na + nb) * D;
+  if (idx >= total) return;
+  int r = idx / D, c = idx - r * D;
+  out[idx] = (r < na) ? A[idx] : B[(r - na) * D + c];
+}
+__global__ void ns_slice2_kernel(const float* __restrict__ in, float* __restrict__ out,
+                                 int M, int C, int cs, int ce) {
+  int ow = ce - cs;
+  int idx_i = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = M * ow;
+  if (idx_i >= total) return;
+  int r = idx_i / ow, c = idx_i - r * ow;
+  out[idx_i] = in[r * C + cs + c];
+}
+__global__ void ns_slicerows_kernel(const float* __restrict__ in, float* __restrict__ out,
+                                    int C, int rs, int re) {
+  int idx_i = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = (re - rs) * C;
+  if (idx_i >= total) return;
+  int r = idx_i / C, c = idx_i - r * C;
+  out[idx_i] = in[(rs + r) * C + c];
+}
+__global__ void ns_index_kernel(const float* __restrict__ in, const int64_t* __restrict__ idx,
+                                float* __restrict__ out, int M, int C, int L) {
+  int idx_i = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = M * L;
+  if (idx_i >= total) return;
+  int r = idx_i / L, k = idx_i - r * L;
+  out[idx_i] = in[r * C + idx[k]];
+}
+__global__ void ns_indexrows_kernel(const float* __restrict__ in, const int64_t* __restrict__ idx,
+                                    float* __restrict__ out, int L, int C) {
+  int idx_i = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = L * C;
+  if (idx_i >= total) return;
+  int r = idx_i / C, c = idx_i - r * C;
+  out[idx_i] = in[(int)idx[r] * C + c];
+}
+__global__ void ns_scatter_kernel(const float* __restrict__ in, const int64_t* __restrict__ idx,
+                                  const float* __restrict__ upd, float* __restrict__ out,
+                                  int M, int C, int L) {
+  int idx_i = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = M * C;
+  if (idx_i >= total) return;
+  int r = idx_i / C, c = idx_i - r * C;
+  out[idx_i] = in[idx_i];
+  for (int k = 0; k < L; k++)
+    if (idx[k] == c) { out[idx_i] = upd[r * L + k]; break; }
+}
+__global__ void ns_scatterrows_kernel(const float* __restrict__ in, const int64_t* __restrict__ idx,
+                                      const float* __restrict__ upd, float* __restrict__ out,
+                                      int R, int C, int L) {
+  int idx_i = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = R * C;
+  if (idx_i >= total) return;
+  int r = idx_i / C, c = idx_i - r * C;
+  out[idx_i] = in[idx_i];
+  for (int k = 0; k < L; k++)
+    if (idx[k] == r) { out[idx_i] = upd[k * C + c]; break; }
+}
+__global__ void ns_embedding_kernel(const float* __restrict__ W, const float* __restrict__ idx,
+                                    float* __restrict__ out, int n, int V, int D) {
+  int idx_i = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = n * D;
+  if (idx_i >= total) return;
+  int r = idx_i / D, c = idx_i - r * D;
+  int k = (int)idx[r];
+  if (k < 0 || k >= V) k = 0;
+  out[idx_i] = W[k * D + c];
+}
+// Multi-head attention core: one block per (batch, head). Grid = B*H blocks.
+// Shared memory holds the S*S score matrix (dynamic shared memory). Q, K, V
+// are already projected on device (each [B*S, D]); Out accumulates the per-head
+// context [B*S, D]. Head dimension Dk = D/H, sequence length S, scale=1/sqrt(Dk).
+extern "C" __global__ void ns_attention_core_kernel(
+    const float* __restrict__ Q, const float* __restrict__ K,
+    const float* __restrict__ V, float* __restrict__ Out,
+    int S, int D, int H, float scale) {
+  extern __shared__ float sc[];   // [S*S]
+  int b = blockIdx.x / H, h = blockIdx.x - b * H;
+  int Dk = D / H;
+  const float* Qb = Q + b * S * D + h * Dk;
+  const float* Kb = K + b * S * D + h * Dk;
+  const float* Vb = V + b * S * D + h * Dk;
+  // scores[i,j] = Qb[i*D + d] . Kb[j*D + d] * scale
+  for (int t = threadIdx.x; t < S * S; t += blockDim.x) {
+    int i = t / S, j = t - i * S;
+    float a = 0.f;
+    for (int d = 0; d < Dk; d++)
+      a += Qb[i * D + d] * Kb[j * D + d];
+    sc[t] = a * scale;
+  }
+  __syncthreads();
+  // row softmax in-place
+  for (int i = threadIdx.x; i < S; i += blockDim.x) {
+    float mx = sc[i * S];
+    for (int j = 1; j < S; j++) mx = fmaxf(mx, sc[i * S + j]);
+    float s = 0.f;
+    for (int j = 0; j < S; j++) { sc[i * S + j] = expf(sc[i * S + j] - mx); s += sc[i * S + j]; }
+    for (int j = 0; j < S; j++) sc[i * S + j] /= s;
+  }
+  __syncthreads();
+  // context[i,d] = sum_j sc[i,j] * Vb[j*D+d]
+  float* Ob = Out + b * S * D + h * Dk;
+  for (int i = threadIdx.x; i < S; i += blockDim.x)
+    for (int d = 0; d < Dk; d++) {
+      float a = 0.f;
+      for (int j = 0; j < S; j++) a += sc[i * S + j] * Vb[j * D + d];
+      Ob[i * D + d] = a;
+    }
+}
+// Mixture-of-experts router: one thread per token. Router logits = x @ Wg with
+// a softmax over experts; the top-1 expert per token is applied to x (its [D,D]
+// matrix lives at We + e*D*D) and the result is scaled by the routing weight.
+__global__ void ns_moe_kernel(const float* __restrict__ x, const float* __restrict__ Wg,
+                              const float* __restrict__ We, float* __restrict__ out,
+                              int M, int D, int E) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= M) return;
+  float lg[256];
+  int Ee = E < 256 ? E : 256;
+  float mx = -1.0e30f;
+  for (int e = 0; e < Ee; e++) {
+    float a = 0.f;
+    for (int k = 0; k < D; k++) a += x[i * D + k] * Wg[k * E + e];
+    lg[e] = a;
+    mx = fmaxf(mx, a);
+  }
+  float sum = 0.f;
+  for (int e = 0; e < Ee; e++) { lg[e] = expf(lg[e] - mx); sum += lg[e]; }
+  int best = 0;
+  for (int e = 1; e < Ee; e++) if (lg[e] > lg[best]) best = e;
+  float p = (sum > 0.f) ? lg[best] / sum : 0.f;
+  for (int j = 0; j < D; j++) {
+    float a = 0.f;
+    for (int k = 0; k < D; k++) a += x[i * D + k] * We[best * D * D + k * D + j];
+    out[i * D + j] = p * a;
+  }
+}
 __global__ void ns_binop_kernel(const float* __restrict__ A, const float* __restrict__ B,
                                 float* __restrict__ C, int n, int nb, int code) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;

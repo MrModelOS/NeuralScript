@@ -4,7 +4,7 @@ A small end-to-end compiler for a neural-network DSL: `network {...}` definition
 lower through a typed IR to standalone C++ inference kernels or self-contained
 C-ABI runtime drivers with **AOT-compiled training** (backward tape
 + Muon / AdamW weight updates) — no runtime graph, no Python-side numerics.
-*Version 1.1.0.*
+*Version 1.2.0.*
 
 ## Highlights
 
@@ -22,7 +22,40 @@ C-ABI runtime drivers with **AOT-compiled training** (backward tape
   AdamW fallback), verified to converge on real MLPs (XOR: loss → ~0)
 - AOT training cores (CPU + CUDA) each get a fused optimizer step generated
   ahead of time; all optimizer hyperparameters live in one place,
-  `include/ns/optim/optim_params.hpp`
+`include/ns/optim/optim_params.hpp`
+
+## v1.2: data movement, attention, MoE
+
+The forward pipeline now accepts the full feature-lowering stack beyond
+`matmul + activation + dropout`:
+
+- **Data-movement ops** (CPU `ns_*` kernels + CUDA kernels, both static-weight
+  and runtime-rows variants): `concat(a, b, axis)`, `transpose(t)`,
+  `reshape(t, r, c)`, `slice(t, axis, start, stop)`, `index(t, axis, i0, i1, …)`
+  and `scatter(t, axis, upd, i0, i1, …)` — usable directly in `forward()`
+  bodies via ordinary function-call syntax.
+- **`Embedding(vocab_size, d_model)`** layer: index tensor ([B, seq]) → row
+  lookups ([B, seq, d_model]).
+- **`Attention(d_model, heads)` / `MultiHeadAttention`** layer: dense
+  Q/K/V/O projections + scaled dot-product attention + per-head softmax, with a
+  fused CPU kernel and an SM-tiled CUDA core (`ns_attention_core_kernel`).
+- **`LayerNorm()`** normalization layer ([…, last] covariance, eps within).
+  `attention → layernorm` (residual sandwich) is the intended v1.2 block.
+- **`MoE(d_model, num_experts)` / `MixtureOfExperts`** router: gate logits
+  `x @ Wg`, softmax over experts, per-token **top-1** dispatch, and the chosen
+  expert's `[D,D]` matrix applied to the token scaled by its routing weight —
+  fused as `ns_moe_fwd` / `ns_moe_kernel`.
+- `concat`/`transpose`/`reshape`/`slice`/`index`/`scatter` lower through the
+  parser's function-call path (new instruction forms `ns.concat`,
+  `ns.slice`, `ns.index`, `ns.scatter`, …), so they typecheck, fuse and
+  codegen like any other v1.2 head. Attention/embedding/layernorm/MoE are
+  forward-only in AOT training (backprop through them is deferred).
+
+Core tests: `test_transformer` (embedding→attention→layernorm vs a scalar
+reference), `test_datamove` (programmatic embedding→matmul→transpose→concat→
+reshape→layernorm), `test_dsl_datamove` (parser path for slice/index/scatter/
+concat/transpose/reshape), `test_moe` (router vs a scalar reference); each also
+`nvcc -c`-validates the emitted CUDA.
 
 ## Build
 
@@ -41,7 +74,7 @@ cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
 cmake --build build-asan -j && ctest --test-dir build-asan
 ```
 
-Installed (CPU) suite: 11 tests. Optional CUDA backend integration test —
+Installed (CPU) suite: 15 tests. Optional CUDA backend integration test —
 opt-in so plain `ctest` stays green on machines without a CUDA toolkit or GPU:
 
 ```sh
@@ -168,7 +201,7 @@ loss is the mean over the batch.
 | `src/optim`, `src/training` | Muon/AdamW reference optimizer, `NumericTrainer` |
 | `include/ns/optim/optim_params.hpp` | canonical optimizer hyperparameters (single source of truth) |
 | `include/ns/runtime/ns_runtime.h` | canonical C-ABI for hosts (training entry points) |
-| `tests/` | frontend + codegen + runtime + AOT-training integration tests (11) |
+| `tests/` | frontend + codegen + runtime + AOT-training integration tests (15) |
 
 ## License
 

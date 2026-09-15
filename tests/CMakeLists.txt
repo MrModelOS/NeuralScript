@@ -24,6 +24,27 @@ target_link_libraries(test_codegen_cpu ns_core)
 add_test(NAME test_codegen_cpu COMMAND test_codegen_cpu)
 set_tests_properties(test_codegen_cpu PROPERTIES TIMEOUT 120)
 
+add_executable(test_transformer test_transformer.cpp)
+target_link_libraries(test_transformer ns_core)
+add_test(NAME test_transformer COMMAND test_transformer)
+set_tests_properties(test_transformer PROPERTIES TIMEOUT 120)
+
+add_executable(test_datamove test_datamove.cpp)
+target_link_libraries(test_datamove ns_core)
+add_test(NAME test_datamove COMMAND test_datamove)
+set_tests_properties(test_datamove PROPERTIES TIMEOUT 120)
+
+add_executable(test_dsl_datamove test_dsl_datamove.cpp)
+target_link_libraries(test_dsl_datamove ns_core)
+add_test(NAME test_dsl_datamove COMMAND test_dsl_datamove)
+set_tests_properties(test_dsl_datamove PROPERTIES TIMEOUT 120)
+set_tests_properties(test_transformer test_datamove test_dsl_datamove PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_moe test_moe.cpp)
+target_link_libraries(test_moe ns_core)
+add_test(NAME test_moe COMMAND test_moe)
+set_tests_properties(test_moe PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+
 add_executable(test_dynamic_dims test_dynamic_dims.cpp)
 target_link_libraries(test_dynamic_dims ns_core)
 add_test(NAME test_dynamic_dims COMMAND test_dynamic_dims)

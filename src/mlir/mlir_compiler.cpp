@@ -109,27 +109,94 @@ void MLIRCompiler::compile_network(Stmt* stmt, MLIRModule& module) {
             } else if (p.name == "rate" && p.value) {
                 try { meta.dropout_rate = std::stod(p.value->token.value); }
                 catch (...) {}
+            } else if ((p.name == "heads" || p.name == "num_heads") && p.value) {
+                int64_t hv; if (resolve_dim_int(p.value.get(), hv)) meta.num_heads = hv;
+            } else if ((p.name == "experts" || p.name == "num_experts") && p.value) {
+                int64_t ev; if (resolve_dim_int(p.value.get(), ev)) meta.num_experts = ev;
+            } else if ((p.name == "d_model" || p.name == "n_embd" || p.name == "dim")
+                       && p.value) {
+                int64_t dv; if (resolve_dim_int(p.value.get(), dv)) meta.emb_dim = dv;
+            } else if ((p.name == "vocab" || p.name == "vocab_size") && p.value) {
+                int64_t vv; if (resolve_dim_int(p.value.get(), vv)) meta.vocab_size = vv;
             }
         }
         layer_meta_[layer->layer_name] = meta;
 
-        bool trainable = layer->layer_type == "Dense" || layer->layer_type == "Linear";
+        bool trainable = layer->layer_type == "Dense" || layer->layer_type == "Linear" ||
+                         layer->layer_type == "Embedding" ||
+                         layer->layer_type == "Attention" ||
+                         layer->layer_type == "MultiHeadAttention" ||
+                         layer->layer_type == "MoE" ||
+                         layer->layer_type == "MixtureOfExperts";
         if (!trainable) continue;
 
-        int64_t in_d = -1, out_d = -1;
-        for (auto& p : layer->layer_params) {
-            if (p.name == "in" && p.value) { int64_t v; if (resolve_dim_int(p.value.get(), v)) in_d = v; }
-            else if (p.name == "out" && p.value) { int64_t v; if (resolve_dim_int(p.value.get(), v)) out_d = v; }
-        }
-        if (in_d <= 0 || out_d <= 0) continue; // dynamic weights: not materialized here
+        if (layer->layer_type == "Dense" || layer->layer_type == "Linear") {
+            int64_t in_d = -1, out_d = -1;
+            for (auto& p : layer->layer_params) {
+                if (p.name == "in" && p.value) { int64_t v; if (resolve_dim_int(p.value.get(), v)) in_d = v; }
+                else if (p.name == "out" && p.value) { int64_t v; if (resolve_dim_int(p.value.get(), v)) out_d = v; }
+            }
+            if (in_d <= 0 || out_d <= 0) continue; // dynamic weights: not materialized here
 
-        auto instr = MLIRInstr(MLIROp::TENSOR_ALLOC, layer->layer_name + "_w");
-        instr.result_type = TensorType({DimExpr::constant(in_d), DimExpr::constant(out_d)},
-                                       Dtype::Float32);
-        instr.comment = "allocate weight [" + std::to_string(in_d) + ", " +
-                        std::to_string(out_d) + "]";
-        layer_weight_id_[layer->layer_name] = layer->layer_name + "_w";
-        weight_allocs.push_back(instr);
+            auto instr = MLIRInstr(MLIROp::TENSOR_ALLOC, layer->layer_name + "_w");
+            instr.result_type = TensorType({DimExpr::constant(in_d), DimExpr::constant(out_d)},
+                                           Dtype::Float32);
+            instr.comment = "allocate weight [" + std::to_string(in_d) + ", " +
+                            std::to_string(out_d) + "]";
+            layer_weight_id_[layer->layer_name] = layer->layer_name + "_w";
+            meta.weight_ids.push_back(layer->layer_name + "_w");
+            weight_allocs.push_back(instr);
+        } else if (layer->layer_type == "Embedding") {
+            int64_t V = meta.vocab_size, D = meta.emb_dim;
+            if (V <= 0 || D <= 0) continue;
+            auto instr = MLIRInstr(MLIROp::TENSOR_ALLOC, layer->layer_name + "_w");
+            instr.result_type = TensorType({DimExpr::constant(V), DimExpr::constant(D)},
+                                           Dtype::Float32);
+            instr.comment = "allocate embedding [" + std::to_string(V) + ", " +
+                            std::to_string(D) + "]";
+            layer_weight_id_[layer->layer_name] = layer->layer_name + "_w";
+            meta.weight_ids.push_back(layer->layer_name + "_w");
+            weight_allocs.push_back(instr);
+        } else if (layer->layer_type == "Attention" ||
+                   layer->layer_type == "MultiHeadAttention") {
+            int64_t D = meta.emb_dim, H = meta.num_heads;
+            if (D <= 0 || H <= 0 || D % H != 0) continue;
+            const char* names[4] = {"_q", "_k", "_v", "_o"};
+            for (auto& nm : names) {
+                auto instr = MLIRInstr(MLIROp::TENSOR_ALLOC,
+                                       layer->layer_name + nm + "_w");
+                instr.result_type = TensorType({DimExpr::constant(D), DimExpr::constant(D)},
+                                               Dtype::Float32);
+                instr.comment = "allocate attention weight [" + std::to_string(D) +
+                                ", " + std::to_string(D) + "]";
+                meta.weight_ids.push_back(layer->layer_name + nm + "_w");
+                weight_allocs.push_back(instr);
+            }
+            // NOTE: no single layer_weight_id_ entry for attention; the forward
+            // lowering reads meta.weight_ids directly.
+        }
+
+        if (layer->layer_type == "MoE" || layer->layer_type == "MixtureOfExperts") {
+            int64_t D = meta.emb_dim, E = meta.num_experts;
+            if (D <= 0 || E <= 0) continue;
+            // Gate weight [D, E] + per-expert projections [E, D, D] (flattened).
+            auto gate = MLIRInstr(MLIROp::TENSOR_ALLOC, layer->layer_name + "_g_w");
+            gate.result_type = TensorType({DimExpr::constant(D), DimExpr::constant(E)},
+                                          Dtype::Float32);
+            gate.comment = "allocate MoE router [" + std::to_string(D) + ", " +
+                           std::to_string(E) + "]";
+            auto exp = MLIRInstr(MLIROp::TENSOR_ALLOC, layer->layer_name + "_e_w");
+            exp.result_type = TensorType({DimExpr::constant(E),
+                                          DimExpr::constant(D * D)},
+                                         Dtype::Float32);
+            exp.comment = "allocate MoE experts [" + std::to_string(E) + ", " +
+                          std::to_string(D) + ", " + std::to_string(D) + "]";
+            meta.weight_ids.push_back(layer->layer_name + "_g_w");
+            meta.weight_ids.push_back(layer->layer_name + "_e_w");
+            weight_allocs.push_back(gate);
+            weight_allocs.push_back(exp);
+        }
+        layer_meta_[layer->layer_name] = meta;
     }
 
     // Note: because the layer's weight shape may differ from the operand that
@@ -428,6 +495,142 @@ void MLIRCompiler::compile_expr(Expr* expr, MLIRFunction& fn, MLIRValue& out) {
             else if (func == "softmax") op = MLIROp::SOFTMAX;
             else if (func == "identity") op = MLIROp::IDENTITY;
             else if (func == "dropout") op = MLIROp::DROPOUT;
+            else if (func == "concat" || func == "transpose" || func == "reshape" ||
+                     func == "slice" || func == "index" || func == "scatter") {
+                // v1.2: data-movement builtins (fiber-style SLICE/INDEX/SCATTER
+                // plus CONCAT/RESHAPE/TRANSPOSE as plain function calls).
+                auto lit_int = [](Expr* e, int64_t& v) -> bool {
+                    if (!e) return false;
+                    if (e->kind == Expr::LITERAL_INT) {
+                        try { v = std::stoll(e->token.value); return true; }
+                        catch (...) { return false; }
+                    }
+                    if (e->kind == Expr::LITERAL_FLOAT) {
+                        try { v = (int64_t)std::stoll(e->token.value); return true; }
+                        catch (...) { return false; }
+                    }
+                    return false;
+                };
+                MLIROp dm;
+                std::string pfx;
+                if (func == "concat") { dm = MLIROp::CONCAT; pfx = "cat"; }
+                else if (func == "transpose") { dm = MLIROp::TRANSPOSE; pfx = "tp"; }
+                else if (func == "reshape") { dm = MLIROp::RESHAPE; pfx = "rs"; }
+                else if (func == "slice") { dm = MLIROp::SLICE; pfx = "sl"; }
+                else if (func == "index") { dm = MLIROp::INDEX; pfx = "ix"; }
+                else { dm = MLIROp::SCATTER; pfx = "sc"; }
+
+                auto instr = MLIRInstr(dm, new_temp(pfx));
+
+                if (func == "concat") {
+                    if (expr->args.size() < 2) break;
+                    MLIRValue a, b;
+                    compile_expr(expr->args[0].get(), fn, a);
+                    compile_expr(expr->args[1].get(), fn, b);
+                    instr.operands = {a.id, b.id};
+                    if (a.type.dims.size() == 2 && b.type.dims.size() == 2) {
+                        int64_t axis = 1;
+                        if (expr->args.size() >= 3) { int64_t ax; if (lit_int(expr->args[2].get(), ax)) axis = ax; }
+                        instr.attribute = std::to_string(axis);
+                        TensorType rt;
+                        if (axis == 0) {
+                            int64_t ra = a.type.dims[0].is_const() ? a.type.dims[0].const_value : 0;
+                            int64_t rb = b.type.dims[0].is_const() ? b.type.dims[0].const_value : 0;
+                            rt.dims = {DimExpr::constant(ra + rb), a.type.dims[1]};
+                        } else {
+                            int64_t ca = a.type.dims[1].is_const() ? a.type.dims[1].const_value : 0;
+                            int64_t cb = b.type.dims[1].is_const() ? b.type.dims[1].const_value : 0;
+                            rt.dims = {a.type.dims[0], DimExpr::constant(ca + cb)};
+                        }
+                        rt.dtype = a.type.dtype;
+                        instr.result_type = rt;
+                    }
+                } else if (func == "transpose") {
+                    if (!expr->args.empty()) {
+                        MLIRValue a;
+                        compile_expr(expr->args[0].get(), fn, a);
+                        instr.operands = {a.id};
+                        if (a.type.dims.size() == 2) {
+                            TensorType rt(std::vector<DimExpr>{a.type.dims[1], a.type.dims[0]},
+                                   a.type.dtype);
+                            instr.result_type = rt;
+                        }
+                    }
+                } else if (func == "reshape") {
+                    MLIRValue a;
+                    if (!expr->args.empty())
+                        compile_expr(expr->args[0].get(), fn, a);
+                    instr.operands = {a.id};
+                    if (expr->args.size() >= 3) {
+                        int64_t r, c;
+                        DimExpr rd = DimExpr::dynamic(), cd = DimExpr::dynamic();
+                        if (lit_int(expr->args[1].get(), r)) rd = DimExpr::constant(r);
+                        if (lit_int(expr->args[2].get(), c)) cd = DimExpr::constant(c);
+                        TensorType rt(std::vector<DimExpr>{rd, cd}, a.type.dtype);
+                        instr.result_type = rt;
+                        instr.attribute = std::to_string(r) + ":" + std::to_string(c);
+                    } else if (a.type.dims.size() == 2) {
+                        instr.result_type = a.type;
+                    }
+                } else if (func == "slice") {
+                    MLIRValue a;
+                    if (!expr->args.empty())
+                        compile_expr(expr->args[0].get(), fn, a);
+                    instr.operands = {a.id};
+                    if (expr->args.size() >= 4) {
+                        int64_t axis = 1, s = 0, e = 0;
+                        if (lit_int(expr->args[1].get(), axis)) {}
+                        if (lit_int(expr->args[2].get(), s)) {}
+                        if (lit_int(expr->args[3].get(), e)) {}
+                        instr.attribute = std::to_string(axis) + ":" + std::to_string(s) + ":" + std::to_string(e);
+                        if (a.type.dims.size() == 2) {
+                            TensorType rt;
+                            if (axis == 0)
+                                rt.dims = {DimExpr::constant(e - s), a.type.dims[1]};
+                            else
+                                rt.dims = {a.type.dims[0], DimExpr::constant(e - s)};
+                            rt.dtype = a.type.dtype;
+                            instr.result_type = rt;
+                        }
+                    }
+                } else { // index / scatter
+                    MLIRValue a;
+                    if (!expr->args.empty())
+                        compile_expr(expr->args[0].get(), fn, a);
+                    int64_t axis = 1;
+                    if (expr->args.size() >= 2) { int64_t ax; if (lit_int(expr->args[1].get(), ax)) axis = ax; }
+                    instr.operands = {a.id};
+                    if (func == "scatter" && expr->args.size() >= 3) {
+                        MLIRValue upd;
+                        compile_expr(expr->args[2].get(), fn, upd);
+                        instr.operands.push_back(upd.id);
+                    }
+                    instr.int_attr = axis;
+                    size_t first_idx = (func == "scatter") ? 3 : 2;
+                    for (size_t k = first_idx; k < expr->args.size(); k++) {
+                        int64_t v;
+                        if (lit_int(expr->args[k].get(), v)) instr.ints_attr.push_back(v);
+                    }
+                    if (a.type.dims.size() == 2) {
+                        TensorType rt;
+                        int64_t L = (int64_t)instr.ints_attr.size();
+                        if (func == "scatter")
+                            rt.dims = a.type.dims;
+                        else if (axis == 0)
+                            rt.dims = {DimExpr::constant(L), a.type.dims[1]};
+                        else
+                            rt.dims = {a.type.dims[0], DimExpr::constant(L)};
+                        rt.dtype = a.type.dtype;
+                        instr.result_type = rt;
+                    }
+                }
+                instr.comment = func + "()";
+                fn.instructions.push_back(instr);
+                out.id = instr.result_id;
+                out.type = instr.result_type;
+                break;
+            }
+
             else op = MLIROp::FN_CALL;
 
             auto instr = MLIRInstr(op, new_temp("f"));
@@ -512,16 +715,10 @@ void MLIRCompiler::lower_activation(const std::string& act, MLIRValue& in,
 void MLIRCompiler::apply_pipeline_stage(const std::string& wname, MLIRValue& in,
                                         MLIRFunction& fn, MLIRValue& out) {
     auto miter = layer_meta_.find(wname);
+    bool is_train_fn = fn.is_train;
     if (miter != layer_meta_.end()) {
-        if (miter->second.type != "Dense" && miter->second.type != "Linear" &&
-            miter->second.type != "Dropout") {
-            throw std::runtime_error(
-                "Unsupported layer type '" + miter->second.type +
-                "' in AOT pipeline lowering (layer '" + wname +
-                "'). Only Dense/Linear and Dropout layers can be lowered; " +
-                "Attention/Embedding/LayerNorm kernels are not yet implemented.");
-        }
-        if (miter->second.type == "Dropout") {
+        const std::string& ty = miter->second.type;
+        if (ty == "Dropout") {
             auto instr = MLIRInstr(MLIROp::DROPOUT, new_temp("fc"));
             instr.operands = {in.id};
             instr.float_attr = miter->second.dropout_rate;
@@ -530,6 +727,92 @@ void MLIRCompiler::apply_pipeline_stage(const std::string& wname, MLIRValue& in,
             fn.instructions.push_back(instr);
             out.id = instr.result_id;
             return;
+        }
+        if (ty == "Embedding") {
+            if (is_train_fn)
+                throw std::runtime_error(
+                    "AOT backprop through Embedding is not implemented yet; "
+                    "use the layer in forward() only");
+            auto wit = layer_weight_id_.find(wname);
+            std::string wid = wit != layer_weight_id_.end() ? wit->second : wname;
+            auto instr = MLIRInstr(MLIROp::LAYER_EMBEDDING, new_temp("emb"));
+            instr.operands = {wid, in.id};
+            instr.result_type = TensorType({DimExpr::dynamic(),
+                                            DimExpr::constant(miter->second.emb_dim)},
+                                           Dtype::Float32);
+            instr.comment = "embedding(" + in.id + ", " + wid + ")";
+            fn.instructions.push_back(instr);
+            out.id = instr.result_id;
+            return;
+        }
+        if (ty == "LayerNorm" || ty == "Normalize") {
+            if (is_train_fn)
+                throw std::runtime_error(
+                    "AOT backprop through LayerNorm is not implemented yet");
+            auto instr = MLIRInstr(MLIROp::LAYERNORM, new_temp("ln"));
+            instr.operands = {in.id};
+            instr.result_type = in.type;
+            instr.comment = "layernorm(" + in.id + ")";
+            fn.instructions.push_back(instr);
+            out.id = instr.result_id;
+            return;
+        }
+        if (ty == "Attention" || ty == "MultiHeadAttention") {
+            if (is_train_fn)
+                throw std::runtime_error(
+                    "AOT backprop through Attention is not implemented yet; "
+                    "use the layer in forward() only");
+            if (miter->second.weight_ids.size() < 4)
+                throw std::runtime_error(
+                    "Attention layer '" + wname +
+                    "' has no materialized q/k/v/o weights (need d_model & heads)");
+            auto instr = MLIRInstr(MLIROp::LAYER_ATTENTION, new_temp("attn"));
+            instr.operands = {in.id,
+                              miter->second.weight_ids[0],
+                              miter->second.weight_ids[1],
+                              miter->second.weight_ids[2],
+                              miter->second.weight_ids[3]};
+            instr.attribute = std::to_string(miter->second.num_heads);
+            instr.int_attr = miter->second.emb_dim;
+            instr.result_type = TensorType({DimExpr::dynamic(),
+                                            DimExpr::constant(miter->second.emb_dim)},
+                                           Dtype::Float32);
+            instr.comment = "attention(" + in.id + ", heads=" +
+                            std::to_string(miter->second.num_heads) + ")";
+            fn.instructions.push_back(instr);
+            out.id = instr.result_id;
+            return;
+        }
+        if (ty == "MoE" || ty == "MixtureOfExperts") {
+            if (is_train_fn)
+                throw std::runtime_error(
+                    "AOT backprop through MoE is not implemented yet; "
+                    "use the layer in forward() only");
+            if (miter->second.weight_ids.size() < 2)
+                throw std::runtime_error(
+                    "MoE layer '" + wname +
+                    "' has no materialized router/expert weights (need d_model & num_experts)");
+            auto instr = MLIRInstr(MLIROp::LAYER_MOE, new_temp("moe"));
+            instr.operands = {in.id,
+                              miter->second.weight_ids[0],
+                              miter->second.weight_ids[1]};
+            instr.attribute = std::to_string(miter->second.num_experts);
+            instr.int_attr = miter->second.emb_dim;
+            instr.result_type = TensorType({DimExpr::dynamic(),
+                                            DimExpr::constant(miter->second.emb_dim)},
+                                           Dtype::Float32);
+            instr.comment = "moe(" + in.id + ", experts=" +
+                            std::to_string(miter->second.num_experts) + ")";
+            fn.instructions.push_back(instr);
+            out.id = instr.result_id;
+            return;
+        }
+        if (ty != "Dense" && ty != "Linear") {
+            throw std::runtime_error(
+                "Unsupported layer type '" + ty + "' in AOT pipeline lowering "
+                "(layer '" + wname +
+                "'). Supported: Dense/Linear, Dropout, Embedding, Attention, "
+                "MultiHeadAttention, LayerNorm, MoE, MixtureOfExperts.");
         }
     }
 
@@ -601,6 +884,13 @@ std::string MLIRCompiler::dump(MLIRModule& module) {
                 case MLIROp::LAYER_ATTENTION: oss << "ns.layer.attention"; break;
                 case MLIROp::LAYER_EMBEDDING: oss << "ns.layer.embedding"; break;
                 case MLIROp::LAYER_LAYERNORM: oss << "ns.layer.layernorm"; break;
+                case MLIROp::LAYER_MOE: oss << "ns.layer.moe"; break;
+                case MLIROp::CONCAT: oss << "ns.concat"; break;
+                case MLIROp::RESHAPE: oss << "ns.reshape"; break;
+                case MLIROp::TRANSPOSE: oss << "ns.transpose"; break;
+                case MLIROp::SLICE: oss << "ns.slice"; break;
+                case MLIROp::INDEX: oss << "ns.index"; break;
+                case MLIROp::SCATTER: oss << "ns.scatter"; break;
                 case MLIROp::CONSTANT: oss << "ns.constant"; break;
                 case MLIROp::FN_CALL: oss << "ns.fn.call"; break;
                 case MLIROp::OPT_STEP: oss << "ns.opt.step"; break;

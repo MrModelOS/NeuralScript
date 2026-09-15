@@ -521,6 +521,70 @@ void ShapeChecker::check_expr(Expr* expr) {
                 } else {
                     expr->inferred_type = std::make_unique<TypeNode>(Dtype::Float32);
                 }
+            } else if (func_name == "slice" || func_name == "index" ||
+                       func_name == "scatter" || func_name == "concat" ||
+                       func_name == "transpose" || func_name == "reshape") {
+                // v1.2 data-movement builtins. Concrete dimensions are set by
+                // the MLIR lowering; here we only need tensor-typed passthrough
+                // so downstream shape checks keep working.
+                if (!expr->args.empty() && expr->args[0]->inferred_type &&
+                    expr->args[0]->inferred_type->is_tensor()) {
+                    auto tt = expr->args[0]->inferred_type->tensor_type;
+                    if (func_name == "transpose" && tt.dims.size() == 2) {
+                        std::swap(tt.dims[0], tt.dims[1]);
+                    } else if (func_name == "concat" && expr->args.size() >= 2 &&
+                               expr->args[1]->inferred_type &&
+                               expr->args[1]->inferred_type->is_tensor()) {
+                        auto tb = expr->args[1]->inferred_type->tensor_type;
+                        if (tt.dims.size() == 2 && tb.dims.size() == 2) {
+                            int64_t axis = 1;
+                            if (expr->args.size() >= 3 &&
+                                expr->args[2]->kind == Expr::LITERAL_INT) {
+                                try { axis = std::stoll(expr->args[2]->token.value); }
+                                catch (...) { }
+                            }
+                            if (axis == 0) {
+                                auto c = [](const DimExpr& d, int64_t rb) {
+                                    return DimExpr::constant((d.is_const() ? d.const_value : 0) + rb);
+                                };
+                                int64_t rb = tb.dims[0].is_const() ? tb.dims[0].const_value : 0;
+                                tt.dims[0] = c(tt.dims[0], rb);
+                            } else {
+                                int64_t ca = tt.dims[1].is_const() ? tt.dims[1].const_value : 0;
+                                int64_t cb = tb.dims[1].is_const() ? tb.dims[1].const_value : 0;
+                                tt.dims[1] = DimExpr::constant(ca + cb);
+                            }
+                        }
+                    } else if (func_name == "slice" && tt.dims.size() == 2 &&
+                               expr->args.size() >= 4 &&
+                               expr->args[2]->kind == Expr::LITERAL_INT &&
+                               expr->args[3]->kind == Expr::LITERAL_INT) {
+                        int64_t s = 0, e = 0, axis = 1;
+                        try { s = std::stoll(expr->args[2]->token.value); }
+                        catch (...) { }
+                        try { e = std::stoll(expr->args[3]->token.value); }
+                        catch (...) { }
+                        if (expr->args[1]->kind == Expr::LITERAL_INT) {
+                            try { axis = std::stoll(expr->args[1]->token.value); }
+                            catch (...) { }
+                        }
+                        tt.dims[axis == 0 ? 0 : 1] = DimExpr::constant(e - s);
+                    } else if (func_name == "index" && tt.dims.size() == 2) {
+                        int64_t axis = 1;
+                        if (expr->args.size() >= 2 && expr->args[1]->kind == Expr::LITERAL_INT) {
+                            try { axis = std::stoll(expr->args[1]->token.value); }
+                            catch (...) { }
+                        }
+                        size_t nidx = expr->args.size() - (axis == 0 ? 2 : 2);
+                        if (axis == 0)
+                            tt.dims[0] = DimExpr::constant((int64_t)nidx);
+                        else
+                            tt.dims[1] = DimExpr::constant((int64_t)nidx);
+                    }
+                    expr->inferred_type = std::make_unique<TypeNode>(tt);
+                } else {
+                    expr->inferred_type = std::make_unique<TypeNode>(Dtype::Float32);
+                }
             } else if (func_name == "forward" || func_name == "step") {
                 // Network method call; result is a tensor (passthrough).
                 if (!expr->args.empty() && expr->args[0]->inferred_type) {
@@ -720,6 +784,12 @@ std::vector<DimExpr> LayerRule::apply(const std::vector<DimExpr>& in_dims, bool&
             ok = true;
             return in_dims;
         }
+        case LayerKind::MoE: {
+            // Mixture-of-Experts: router + experts act on the hidden dim,
+            // output has the same shape as the input.
+            ok = true;
+            return in_dims;
+        }
         default:
             ok = false;
             return base;
@@ -743,6 +813,7 @@ LayerRule ShapeChecker::parse_layer_rule(Stmt* layer) {
     else if (lt == "LayerNorm") rule.kind = LayerKind::LayerNorm;
     else if (lt == "Attention" || lt == "MultiHeadAttention") rule.kind = LayerKind::Attention;
     else if (lt == "Embedding") rule.kind = LayerKind::Embedding;
+    else if (lt == "MoE" || lt == "MixtureOfExperts") rule.kind = LayerKind::MoE;
     else rule.kind = LayerKind::Unknown;
 
     for (auto& p : layer->layer_params) {
@@ -771,6 +842,9 @@ LayerRule ShapeChecker::parse_layer_rule(Stmt* layer) {
         } else if (p.name == "heads" || p.name == "num_heads") {
             if (!v.empty() && std::isdigit((unsigned char)v[0])) rule.num_heads = DimExpr::constant(std::stoll(v));
             else rule.num_heads = DimExpr::symbolic(v);
+        } else if (p.name == "experts" || p.name == "num_experts") {
+            if (!v.empty() && std::isdigit((unsigned char)v[0])) rule.num_experts = DimExpr::constant(std::stoll(v));
+            else rule.num_experts = DimExpr::symbolic(v);
         }
     }
     return rule;

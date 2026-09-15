@@ -24,6 +24,7 @@ enum class LayerKind {
     LayerNorm,
     Attention,
     Embedding,
+    MoE,
     Activation
 };
 
@@ -38,6 +39,7 @@ struct LayerRule {
     DimExpr emb_vocab; // Embedding vocab
     DimExpr emb_dim;   // Embedding dim
     DimExpr num_heads; // Attention
+    DimExpr num_experts; // MoE
     std::string activation; // activation name
     double rate = 0.0;  // Dropout rate
 

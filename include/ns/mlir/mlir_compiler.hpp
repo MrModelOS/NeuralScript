@@ -31,6 +31,9 @@ enum class MLIROp {
     CONCAT,
     RESHAPE,
     TRANSPOSE,
+    SLICE,             // extract a range: operands {in}, attribute "axis:start:stop"
+    INDEX,             // column/row gather: operands {in}, int_attr=axis, ints_attr=indices
+    SCATTER,           // scatter updates: operands {in, upd}, int_attr=axis, ints_attr=indices
     CONSTANT,
 
     // Reverse-mode (AOT backward pass) ops
@@ -51,6 +54,7 @@ enum class MLIROp {
     LAYER_ATTENTION,
     LAYER_EMBEDDING,
     LAYER_LAYERNORM,
+    LAYER_MOE,
 
     // Storage
     ALLOC_BUFFER,      // allocate GPU buffer
@@ -90,9 +94,10 @@ struct MLIRInstr {
 
     // Auxiliary data
     std::string comment;
-    std::string attribute; // e.g., activation type, loss type
+    std::string attribute; // e.g., activation type, loss type, "axis:start:stop"
     int64_t int_attr = 0;
     double float_attr = 0.0;
+    std::vector<int64_t> ints_attr; // index lists for INDEX/SCATTER
 
     MLIRInstr() : op(MLIROp::CONSTANT), int_attr(0), float_attr(0.0) {}
     MLIRInstr(MLIROp o, std::string res) : op(o), result_id(std::move(res)),
@@ -136,9 +141,15 @@ private:
     std::map<std::string, std::string> layer_weight_id_;
     // Layer metadata for forward lowering (activation, dropout rate).
     struct LayerMeta {
-        std::string type;          // "Dense", "Dropout", ...
+        std::string type;          // "Dense", "Dropout", "Embedding", ...
         std::string activation;    // "ReLU"/"GELU"/... (empty if none)
         double dropout_rate = 0.0;
+        int64_t num_heads = 1;     // Attention / MultiHeadAttention
+        int64_t num_experts = 4;   // MoE / MixtureOfExperts
+        int64_t emb_dim = 0;       // Embedding / Attention d_model
+        int64_t vocab_size = 0;    // Embedding vocab
+        // Weight buffer ids for layers with >1 trainable matrices.
+        std::vector<std::string> weight_ids;
     };
     std::map<std::string, LayerMeta> layer_meta_;
     // Resolve a dimension expression value (int literal or alias) to a const,
