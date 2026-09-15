@@ -73,7 +73,9 @@ gradient instructions, so they can be used in AOT training bodies:
   backend. The optimizer steps on the MoE gate and expert weights separately
   (`moe_g_w`, `moe_e_w`) and on the four attention projection matrices
   (`attn_q_w`, `attn_k_w`, `attn_v_w`, `attn_o_w`). Attention is verified by
-  `test_attention_train` (copy-first-token over a 16-token sequence, 16/16).
+  `test_attention_train` (copy-first-token over a 16-token sequence, 16/16),
+  and the full stack trains end-to-end in `test_transformer_train`
+  (emb→attn→ln→mlp→CE, copy-first-token, 16/16) — both CPU and CUDA.
 
 Core tests: `test_transformer` (embedding→attention→layernorm vs a scalar
 reference), `test_datamove` (programmatic embedding→matmul→transpose→concat→
@@ -98,7 +100,7 @@ cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
 cmake --build build-asan -j && ctest --test-dir build-asan
 ```
 
-Installed (CPU) suite: 19 tests. Optional CUDA backend integration test —
+Installed (CPU) suite: 20 tests. Optional CUDA backend integration test —
 opt-in so plain `ctest` stays green on machines without a CUDA toolkit or GPU:
 
 ```sh
@@ -125,6 +127,11 @@ AOT-training loop on a CUDA-capable device and verifies weight writeback and
   fed as a single input (S=N), 12000 steps at lr=0.01, loss
   ~1.386 → ~0.00000, 16/16 device accuracy through `ns_attention_core_kernel`
   + `ns_attention_grad_kernel`.
+- **Transformer path** — TRANSFORM (emb 8×16 → attention d=16/h=4 →
+  LayerNorm → MLP 16→32→16 → linear 16×4, 2240 params): same first-token task,
+  15000 steps at lr=0.007, loss ~1.384 → ~0.00000, 16/16 device accuracy,
+  exercising `ns_layernorm_grad_kernel` together with the attention and MLP
+  backward paths.
 
 Without nvcc or a GPU the test self-skips (exit 77, reported as SKIPPED by
 CTest). GPU-heavy runs are separated into `.github/workflows/cuda.yml`

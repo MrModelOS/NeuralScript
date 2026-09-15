@@ -150,6 +150,44 @@ network ATTEND {
 }
 )";
 
+// Full transformer stack on device: embedding -> attention -> layernorm ->
+// MLP -> dense head, same first-token task. Validates the LAYERNORM_GRAD
+// device path (ns_layernorm_grad_kernel) together with attention and MLP.
+static const char* TRANSFORM = R"(
+type Bs = Dynamic
+network TRANSFORM {
+    input:  Tensor[Bs] float32
+    output: Tensor[Bs, 4] float32
+    layer emb   = Embedding(vocab_size: 8, d_model: 16)
+    layer attn  = Attention(d_model: 16, heads: 4)
+    layer ln    = LayerNorm()
+    layer mlp1  = Dense(in: 16, out: 32, activation: ReLU)
+    layer mlp2  = Dense(in: 32, out: 16, activation: Identity)
+    layer fc    = Dense(in: 16, out: 4, activation: Identity)
+    forward(x) {
+        var h  = x -> emb
+        var a  = h -> attn
+        var n  = a -> ln
+        var m1 = n -> mlp1
+        var m2 = m1 -> mlp2
+        var t  = m2 -> fc
+        return t
+    }
+    train(x: Tensor[Bs], labels: Tensor[Bs, 4]) -> float32 {
+        grad {
+            var h     = x -> emb
+            var at    = h -> attn
+            var ln_   = at -> ln
+            var mlp1o = relu(ln_ @ mlp1)
+            var mlp2o = mlp1o @ mlp2
+            var preds = mlp2o @ fc
+            var loss  = cross_entropy(preds, labels)
+        }
+        return loss
+    }
+}
+)";
+
 static int run_cmd(const std::string& cmd) {
     int rc = std::system(cmd.c_str());
     if (rc == -1) return -1;
@@ -365,6 +403,54 @@ static std::string attn_host_source() {
              "  }\n"
              "  if (acc != N) return fail(\"accuracy\");\n"
              "  std::printf(\"attn: loss0=%.4f lossT=%.5f acc=16/16\\n\", loss0, lossT);\n"
+             "  ns_free(m);\n"
+             "  return 0;\n"
+             "}\n";
+        s = o.str();
+    }
+    return s;
+}
+
+// Transformer host: same first-token task as ATTEND, but the net also has the
+// LayerNorm + MLP block, so this validates the layernorm backward on device.
+static std::string trans_host_source() {
+    std::string s;
+    {
+        std::ostringstream o;
+        write_host_abi(o, /*use_cuda_runtime=*/true);
+        o << "int main() {\n"
+             "  int dev = 0;\n"
+             "  if (cudaGetDeviceCount(&dev) != cudaSuccess || dev <= 0) return 77;\n"
+             "  const int N = 16, C = 4, V = 8, nw = 8 * 16 + 4 * 16 * 16 + 16 * 32 + 32 * 16 + 16 * 4;\n"
+             "  std::vector<float> xs(N);\n"
+             "  std::vector<float> ys(N * C, 0.f);\n"
+             "  unsigned s = 99u;\n"
+             "  for (int i = 0; i < N; i++) { s = s * 1103515245u + 12345u; xs[i] = (float)((s >> 16) % V); }\n"
+             "  int cls0 = (int)xs[0] % C;\n"
+             "  for (int i = 0; i < N; i++) ys[i * C + cls0] = 1.f;\n"
+             "  std::vector<float> w(nw);\n"
+             "  s = 12345u;\n"
+             "  for (auto& v : w) { s = s * 1103515245u + 12345u; v = ((float)(s >> 16) / 65535.f - 0.5f) * 0.2f; }\n"
+             "  ns_model* m = ns_runtime_init(w.data(), nw);\n"
+             "  if (!m) return fail(\"init\");\n"
+             "  float loss0 = -1.f;\n"
+             "  if (ns_objective_loss(m, xs.data(), ys.data(), N, &loss0) != 0) return fail(\"objective(0)\");\n"
+             "  if (!(loss0 > 1.0f && loss0 < 2.0f)) return fail(\"loss0 sanity\");\n"
+             "  float lossT = loss0;\n"
+             "  for (int e = 0; e < 15000; e++) {\n"
+             "    if (ns_runtime_train_step(m, xs.data(), ys.data(), N, &lossT, 0.007f) != 0) return fail(\"train_step\");\n"
+             "  }\n"
+             "  if (!(lossT < 0.5f * loss0)) return fail(\"loss did not decrease\");\n"
+             "  std::vector<float> outs(N * C);\n"
+             "  if (ns_eval_infer(m, xs.data(), outs.data(), N) != 0) return fail(\"eval_infer\");\n"
+             "  int acc = 0;\n"
+             "  for (int i = 0; i < N; i++) {\n"
+             "    int pred = 0;\n"
+             "    for (int c = 1; c < C; c++) if (outs[i * C + c] > outs[i * C + pred]) pred = c;\n"
+             "    if (pred == cls0) acc++;\n"
+             "  }\n"
+             "  if (acc != N) return fail(\"accuracy\");\n"
+             "  std::printf(\"trans: loss0=%.4f lossT=%.5f acc=16/16\\n\", loss0, lossT);\n"
              "  ns_free(m);\n"
              "  return 0;\n"
              "}\n";
@@ -633,6 +719,57 @@ int main() {
         return 1;
     }
 
-    std::cout << "PASS: CUDA codegen (AdamW XOR + Muon MUONX + Dropout DROPOUTX + Attention ATTEND) trained on device\n";
+    // ---- Net 5: TRANSFORM, full transformer stack on device. ----
+    Lexer lexer5(TRANSFORM);
+    auto toks5 = lexer5.tokenize();
+    Parser parser5(toks5);
+    Program prog5 = parser5.parse_program();
+    ShapeChecker checker5;
+    checker5.check(prog5);
+    MLIRCompiler mlir5;
+    auto module5 = mlir5.compile(prog5);
+    FusionPass fuse5;
+    fuse5.run(module5);
+
+    CodegenOptions opts5;
+    opts5.backend = TargetBackend::CUDA;
+    opts5.emit_runtime_driver = true;
+    opts5.function_name = "ns_transform_forward";
+    std::string code5 = cg.generate(module5, opts5);
+    const std::string cu5 = "/tmp/ns_cuda_trans.cu";
+    {
+        std::ofstream of(cu5);
+        of << code5;
+    }
+    if (code5.find("ns_layernorm_grad_kernel") == std::string::npos ||
+        code5.find("ns_attention_grad_kernel") == std::string::npos) {
+        std::cerr << "FAIL: emitted CUDA is missing transformer backward kernels\n";
+        return 1;
+    }
+    if (run_cmd(nvcc + " -c -O2 -std=c++11 " + cu5 + " -o /tmp/ns_cuda_trans.o") != 0) {
+        std::cerr << "FAIL: nvcc rejected the transformer CUDA source\n";
+        return 1;
+    }
+    const std::string host_trans = "/tmp/ns_cuda_trans_host.cpp";
+    {
+        std::ofstream hf(host_trans);
+        hf << trans_host_source();
+    }
+    std::string bin5 = "/tmp/ns_cuda_trans_run";
+    if (run_cmd(nvcc + " -O2 -std=c++11 " + cu5 + " " + host_trans + " -o " + bin5) != 0) {
+        std::cerr << "FAIL: nvcc transformer host link failed\n";
+        return 1;
+    }
+    int rc5 = run_cmd(bin5);
+    if (rc5 == 77) {
+        std::cout << "SKIP: no CUDA-capable device present\n";
+        return 77;
+    }
+    if (rc5 != 0) {
+        std::cerr << "FAIL: CUDA TRANSFORM (transformer AOT) training run failed (exit " << rc5 << ")\n";
+        return 1;
+    }
+
+    std::cout << "PASS: CUDA codegen (AdamW XOR + Muon MUONX + Dropout DROPOUTX + Attention ATTEND + Transformer TRANSFORM) trained on device\n";
     return 0;
 }

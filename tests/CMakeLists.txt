@@ -104,6 +104,13 @@ target_compile_definitions(test_attention_train PRIVATE
 add_test(NAME test_attention_train COMMAND test_attention_train)
 set_tests_properties(test_attention_train PROPERTIES TIMEOUT 120)
 
+add_executable(test_transformer_train test_transformer_train.cpp)
+target_link_libraries(test_transformer_train ns_core)
+target_compile_definitions(test_transformer_train PRIVATE
+    NS_REPO_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../include")
+add_test(NAME test_transformer_train COMMAND test_transformer_train)
+set_tests_properties(test_transformer_train PROPERTIES TIMEOUT 180)
+
 # CUDA backend integration is opt-in: adding it unconditionally would make
 # ctest FAIL/hang on machines without the CUDA toolkit or a device. With
 # -DNS_ENABLE_CUDA=ON the test compiles the emitted .cu with nvcc (if present)
