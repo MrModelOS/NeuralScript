@@ -188,6 +188,34 @@ network TRANSFORM {
 }
 )";
 
+// Full transformer stack on device: embedding -> attention -> layernorm ->
+// MLP -> dense head, same first-token task. Validates the LAYERNORM_GRAD
+// device path (ns_layernorm_grad_kernel) together with attention and MLP.
+static const char* MOEX = R"(
+type Bs = Dynamic
+network MOEX {
+    input:  Tensor[Bs] float32
+    output: Tensor[Bs, 2] float32
+    layer emb = Embedding(vocab_size: 16, d_model: 8)
+    layer moe = MoE(d_model: 8, num_experts: 4, initial_experts: 1)
+    layer fc  = Dense(in: 8, out: 2, activation: Identity)
+    forward(x) {
+        var h = x -> emb
+        var m = h -> moe
+        return m -> fc
+    }
+    train(x: Tensor[Bs], labels: Tensor[Bs, 2]) -> float32 {
+        grad {
+            var h     = x -> emb
+            var m     = h -> moe
+            var preds = m @ fc
+            var loss  = cross_entropy(preds, labels)
+        }
+        return loss
+    }
+}
+)";
+
 static int run_cmd(const std::string& cmd) {
     int rc = std::system(cmd.c_str());
     if (rc == -1) return -1;
@@ -202,6 +230,10 @@ static const char* kHostAbi[] = {
     "extern \"C\" int ns_objective_loss(ns_model*, const float*, const float*, size_t, float*);\n",
     "extern \"C\" int ns_eval_infer(ns_model*, const float*, float*, size_t);\n",
     "extern \"C\" int ns_model_get_weights(const ns_model*, float*, size_t);\n",
+    "extern \"C\" size_t ns_expert_count(const ns_model*);\n",
+    "extern \"C\" size_t ns_expert_birth(ns_model*, int);\n",
+    "extern \"C\" size_t ns_expert_merge(ns_model*, int, int);\n",
+    "extern \"C\" size_t ns_expert_kill(ns_model*, int);\n",
     "extern \"C\" int ns_save_checkpoint(const ns_model*, const char*);\n",
     "extern \"C\" int ns_load_checkpoint(ns_model*, const char*);\n",
     "extern \"C\" void ns_free(ns_model*);\n",
@@ -468,6 +500,67 @@ static std::string trans_host_source() {
              "  }\n"
              "  if (acc != N) return fail(\"accuracy\");\n"
              "  std::printf(\"trans: loss0=%.4f lossT=%.5f acc=16/16\\n\", loss0, lossT);\n"
+             "  ns_free(m);\n"
+             "  return 0;\n"
+             "}\n";
+        s = o.str();
+    }
+    return s;
+}
+
+// MoE host: trains the 16-token -> 2-class task with a single live expert on
+// device (MoE grad kernels: ns_moe_grad_x/wg/we1/we2), then exercises the CUDA
+// expert lifecycle (birth/merge/kill) and an NSM2 checkpoint round-trip.
+static std::string moe_host_source() {
+    std::string s;
+    {
+        std::ostringstream o;
+        write_host_abi(o, /*use_cuda_runtime=*/true);
+        o << "int main() {\n"
+             "  int dev = 0;\n"
+             "  if (cudaGetDeviceCount(&dev) != cudaSuccess || dev <= 0) return 77;\n"
+             "  const int BS = 16, V = 16, C = 2, D = 8, E = 4;\n"
+             "  const size_t nw = V * D + D * E + (size_t)E * D * (4 * D) + (size_t)E * (4 * D) * D + D * C;\n"
+             "  std::vector<float> xs(BS);\n"
+             "  std::vector<float> ys(BS * C, 0.f);\n"
+             "  unsigned s = 42u;\n"
+             "  for (int i = 0; i < BS; i++) { s = s * 1103515245u + 12345u; xs[i] = (float)((s >> 16) % V); }\n"
+             "  for (int i = 0; i < BS; i++) { int cls = ((int)xs[i] < V / 2) ? 0 : 1; ys[i * C + cls] = 1.f; }\n"
+             "  std::vector<float> w(nw);\n"
+             "  s = 12345u;\n"
+             "  for (auto& v : w) { s = s * 1103515245u + 12345u; v = ((float)(s >> 16) / 65535.f - 0.5f) * 0.6f; }\n"
+             "  ns_model* m = ns_runtime_init(w.data(), nw);\n"
+             "  if (!m) return fail(\"init\");\n"
+             "  if (ns_expert_count(m) != 1) return fail(\"count K0=1\");\n"
+             "  float loss0 = -1.f;\n"
+             "  if (ns_objective_loss(m, xs.data(), ys.data(), BS, &loss0) != 0) return fail(\"objective(0)\");\n"
+             "  float lossT = loss0;\n"
+             "  for (int e = 0; e < 400; e++) {\n"
+             "    if (ns_runtime_train_step(m, xs.data(), ys.data(), BS, &lossT, 0.3f) != 0) return fail(\"train_step\");\n"
+             "  }\n"
+             "  if (!(lossT < loss0 * 0.5f)) return fail(\"loss did not decrease\");\n"
+             "  int acc = 0;\n"
+             "  { std::vector<float> outs(BS * C);\n"
+             "    if (ns_eval_infer(m, xs.data(), outs.data(), BS) != 0) return fail(\"eval_infer\");\n"
+             "    for (int i = 0; i < BS; i++) {\n"
+             "      int pred = outs[i * C] >= outs[i * C + 1] ? 0 : 1;\n"
+             "      int want = ((int)xs[i] < V / 2) ? 0 : 1;\n"
+             "      if (pred == want) acc++;\n"
+             "    } }\n"
+             "  if (acc != BS) return fail(\"accuracy\");\n"
+             "  if (ns_expert_birth(m, 3) != 4) return fail(\"birth(3) -> 4\");\n"
+             "  if (ns_expert_merge(m, 0, 1) != 3) return fail(\"merge(0,1) -> 3\");\n"
+             "  std::vector<float> ref(BS * C);\n"
+             "  if (ns_eval_infer(m, xs.data(), ref.data(), BS) != 0) return fail(\"eval ref\");\n"
+             "  if (ns_save_checkpoint(m, \"/tmp/ns_cp_moe.bin\") != 0) return fail(\"save_ckpt\");\n"
+             "  if (ns_expert_kill(m, 2) != 2) return fail(\"kill(2) -> 2\");\n"
+             "  if (ns_load_checkpoint(m, \"/tmp/ns_cp_moe.bin\") != 0) return fail(\"load_ckpt\");\n"
+             "  if (ns_expert_count(m) != 3) return fail(\"count after load\");\n"
+             "  { std::vector<float> out2(BS * C);\n"
+             "    if (ns_eval_infer(m, xs.data(), out2.data(), BS) != 0) return fail(\"eval after load\");\n"
+             "    for (int i = 0; i < BS * C; i++) if (out2[i] != ref[i]) return fail(\"ckpt round-trip drift\"); }\n"
+             "  std::remove(\"/tmp/ns_cp_moe.bin\");\n"
+             "  std::printf(\"moe: loss0=%.4f lossT=%.5f acc=16/16 lifecycle=OK\\n\", loss0, lossT);\n"
              "  ns_free(m);\n"
              "  return 0;\n"
              "}\n";
@@ -787,6 +880,58 @@ int main() {
         return 1;
     }
 
-    std::cout << "PASS: CUDA codegen (AdamW XOR + Muon MUONX + Dropout DROPOUTX + Attention ATTEND + Transformer TRANSFORM) trained on device\n";
+    // ---- Net 6: MOEX, FFN MoE training + expert lifecycle on device. ----
+    Lexer lexer6(MOEX);
+    auto toks6 = lexer6.tokenize();
+    Parser parser6(toks6);
+    Program prog6 = parser6.parse_program();
+    ShapeChecker checker6;
+    checker6.check(prog6);
+    MLIRCompiler mlir6;
+    auto module6 = mlir6.compile(prog6);
+    FusionPass fuse6;
+    fuse6.run(module6);
+
+    CodegenOptions opts6;
+    opts6.backend = TargetBackend::CUDA;
+    opts6.emit_runtime_driver = true;
+    opts6.function_name = "ns_moex_forward";
+    std::string code6 = cg.generate(module6, opts6);
+    const std::string cu6 = "/tmp/ns_cuda_moe.cu";
+    {
+        std::ofstream of(cu6);
+        of << code6;
+    }
+    if (code6.find("ns_moe_grad_we1_kernel") == std::string::npos ||
+        code6.find("ns_moe_mask_sync") == std::string::npos ||
+        code6.find("ns_expert_birth") == std::string::npos) {
+        std::cerr << "FAIL: emitted CUDA is missing the MoE kernel / lifecycle path\n";
+        return 1;
+    }
+    if (run_cmd(nvcc + " -c -O2 -std=c++11 " + cu6 + " -o /tmp/ns_cuda_moe.o") != 0) {
+        std::cerr << "FAIL: nvcc rejected the MoE CUDA source\n";
+        return 1;
+    }
+    const std::string host_moe = "/tmp/ns_cuda_moe_host.cpp";
+    {
+        std::ofstream hf(host_moe);
+        hf << moe_host_source();
+    }
+    std::string bin6 = "/tmp/ns_cuda_moe_run";
+    if (run_cmd(nvcc + " -O2 -std=c++11 " + cu6 + " " + host_moe + " -o " + bin6) != 0) {
+        std::cerr << "FAIL: nvcc MoE host link failed\n";
+        return 1;
+    }
+    int rc6 = run_cmd(bin6);
+    if (rc6 == 77) {
+        std::cout << "SKIP: no CUDA-capable device present\n";
+        return 77;
+    }
+    if (rc6 != 0) {
+        std::cerr << "FAIL: CUDA MOEX (MoE AOT + lifecycle) run failed (exit " << rc6 << ")\n";
+        return 1;
+    }
+
+    std::cout << "PASS: CUDA codegen (AdamW XOR + Muon MUONX + Dropout DROPOUTX + Attention ATTEND + Transformer TRANSFORM + MoE MOEX) trained on device\n";
     return 0;
 }

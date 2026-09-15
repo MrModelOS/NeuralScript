@@ -62,10 +62,13 @@ enum class MLIROp {
     // Embedding backward: scatter-add dOut rows into dW
     EMBEDDING_GRAD_W,
 
-    // MoE backward: input / router-weight / expert-weight gradients
+    // MoE backward: input / router-weight / expert-weight gradients. An
+    // expert is a two-layer FFN (W1: D->ffn, GELU, W2: ffn->D), so there are
+    // two expert-matrix gradients per MoE layer.
     MOE_GRAD_X,
     MOE_GRAD_WG,
-    MOE_GRAD_WE,
+    MOE_GRAD_WE1,
+    MOE_GRAD_WE2,
 
     // Multi-head attention backward: recompute Q/K/V + per-head softmax;
     // one op per output (grad-to-input and four projection weights)
@@ -164,7 +167,9 @@ private:
         std::string activation;    // "ReLU"/"GELU"/... (empty if none)
         double dropout_rate = 0.0;
         int64_t num_heads = 1;     // Attention / MultiHeadAttention
-        int64_t num_experts = 4;   // MoE / MixtureOfExperts
+        int64_t num_experts = 4;   // MoE capacity (compile-time slot count)
+        int64_t ffn_dim = 0;       // MoE expert FFN hidden width (0 = 4*d_model)
+        int64_t initial_experts = 0; // MoE experts born at init (0 = all)
         int64_t emb_dim = 0;       // Embedding / Attention d_model
         int64_t vocab_size = 0;    // Embedding vocab
         // Weight buffer ids for layers with >1 trainable matrices.

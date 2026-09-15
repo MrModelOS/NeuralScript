@@ -102,6 +102,13 @@ target_compile_definitions(test_moe_train PRIVATE
 add_test(NAME test_moe_train COMMAND test_moe_train)
 set_tests_properties(test_moe_train PROPERTIES TIMEOUT 120)
 
+add_executable(test_moe_lifecycle test_moe_lifecycle.cpp)
+target_link_libraries(test_moe_lifecycle ns_core)
+target_compile_definitions(test_moe_lifecycle PRIVATE
+    NS_REPO_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../include")
+add_test(NAME test_moe_lifecycle COMMAND test_moe_lifecycle)
+set_tests_properties(test_moe_lifecycle PROPERTIES TIMEOUT 120)
+
 add_executable(test_attention_train test_attention_train.cpp)
 target_link_libraries(test_attention_train ns_core)
 target_compile_definitions(test_attention_train PRIVATE

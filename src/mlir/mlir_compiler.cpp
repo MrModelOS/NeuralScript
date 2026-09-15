@@ -113,6 +113,12 @@ void MLIRCompiler::compile_network(Stmt* stmt, MLIRModule& module) {
                 int64_t hv; if (resolve_dim_int(p.value.get(), hv)) meta.num_heads = hv;
             } else if ((p.name == "experts" || p.name == "num_experts") && p.value) {
                 int64_t ev; if (resolve_dim_int(p.value.get(), ev)) meta.num_experts = ev;
+            } else if ((p.name == "ffn_dim" || p.name == "ffn" || p.name == "hidden" ||
+                       p.name == "d_ff" || p.name == "intermediate") && p.value) {
+                int64_t fv; if (resolve_dim_int(p.value.get(), fv)) meta.ffn_dim = fv;
+            } else if ((p.name == "initial_experts" || p.name == "active" || p.name == "k" ||
+                       p.name == "initial_active") && p.value) {
+                int64_t kv; if (resolve_dim_int(p.value.get(), kv)) meta.initial_experts = kv;
             } else if ((p.name == "d_model" || p.name == "n_embd" || p.name == "dim")
                        && p.value) {
                 int64_t dv; if (resolve_dim_int(p.value.get(), dv)) meta.emb_dim = dv;
@@ -179,22 +185,38 @@ void MLIRCompiler::compile_network(Stmt* stmt, MLIRModule& module) {
         if (layer->layer_type == "MoE" || layer->layer_type == "MixtureOfExperts") {
             int64_t D = meta.emb_dim, E = meta.num_experts;
             if (D <= 0 || E <= 0) continue;
-            // Gate weight [D, E] + per-expert projections [E, D, D] (flattened).
+            // Expert = two-layer FFN D -> ffn -> D (GELU in between); the spec's
+            // 512 -> 2048 -> 512 is exactly ffn_dim = 4 * d_model. Capacity E and
+            // the per-expert matrix sizes are fixed at compile time; the number of
+            // LIVE experts is a runtime property of the active mask.
+            int64_t H = meta.ffn_dim > 0 ? meta.ffn_dim : 4 * D;
+            meta.ffn_dim = H;
+            int64_t K0 = meta.initial_experts; // 0 -> all experts active
+            if (K0 <= 0 || K0 > E) meta.initial_experts = K0 = E; // normalized
+            // Gate weight [D, E] + expert FFN weights [E, D*H] and [E, H*D].
             auto gate = MLIRInstr(MLIROp::TENSOR_ALLOC, layer->layer_name + "_g_w");
             gate.result_type = TensorType({DimExpr::constant(D), DimExpr::constant(E)},
                                           Dtype::Float32);
             gate.comment = "allocate MoE router [" + std::to_string(D) + ", " +
                            std::to_string(E) + "]";
-            auto exp = MLIRInstr(MLIROp::TENSOR_ALLOC, layer->layer_name + "_e_w");
-            exp.result_type = TensorType({DimExpr::constant(E),
-                                          DimExpr::constant(D * D)},
-                                         Dtype::Float32);
-            exp.comment = "allocate MoE experts [" + std::to_string(E) + ", " +
-                          std::to_string(D) + ", " + std::to_string(D) + "]";
+            auto e1 = MLIRInstr(MLIROp::TENSOR_ALLOC, layer->layer_name + "_e1_w");
+            e1.result_type = TensorType({DimExpr::constant(E),
+                                         DimExpr::constant(D * H)},
+                                        Dtype::Float32);
+            e1.comment = "allocate MoE expert FFN-1 [" + std::to_string(E) + ", " +
+                         std::to_string(D) + " -> " + std::to_string(H) + "]";
+            auto e2 = MLIRInstr(MLIROp::TENSOR_ALLOC, layer->layer_name + "_e2_w");
+            e2.result_type = TensorType({DimExpr::constant(E),
+                                         DimExpr::constant(H * D)},
+                                        Dtype::Float32);
+            e2.comment = "allocate MoE expert FFN-2 [" + std::to_string(E) + ", " +
+                         std::to_string(H) + " -> " + std::to_string(D) + "]";
             meta.weight_ids.push_back(layer->layer_name + "_g_w");
-            meta.weight_ids.push_back(layer->layer_name + "_e_w");
+            meta.weight_ids.push_back(layer->layer_name + "_e1_w");
+            meta.weight_ids.push_back(layer->layer_name + "_e2_w");
             weight_allocs.push_back(gate);
-            weight_allocs.push_back(exp);
+            weight_allocs.push_back(e1);
+            weight_allocs.push_back(e2);
         }
         layer_meta_[layer->layer_name] = meta;
     }
@@ -366,30 +388,39 @@ void MLIRCompiler::compile_stmt(Stmt* stmt, MLIRFunction& fn) {
                     }
                     case MLIROp::LAYER_MOE: {
                         auto cit = g.find(i.result_id);
-                        if (cit == g.end() || i.operands.size() < 3) break;
-                        std::string E = i.attribute.empty() ? "4" : i.attribute;
-                        std::string D = std::to_string(i.int_attr);
+                        if (cit == g.end() || i.operands.size() < 4) break;
                         // dx (gate path + routed expert path)
                         auto mx = MLIRInstr(MLIROp::MOE_GRAD_X, new_temp("g"));
-                        mx.operands = {cit->second, i.operands[0], i.operands[1], i.operands[2]};
-                        mx.attribute = E; mx.int_attr = i.int_attr;
+                        mx.operands = {cit->second, i.operands[0], i.operands[1],
+                                       i.operands[2], i.operands[3]};
+                        mx.attribute = i.attribute; mx.int_attr = i.int_attr;
+                        mx.float_attr = i.float_attr; mx.ints_attr = i.ints_attr;
                         mx.comment = "dx(moe)";
                         fn.instructions.push_back(mx);
                         g[i.operands[0]] = mx.result_id;
                         // dWg (router weights)
                         auto mg = MLIRInstr(MLIROp::MOE_GRAD_WG, new_temp("g"));
                         mg.operands = mx.operands;
-                        mg.attribute = E; mg.int_attr = i.int_attr;
+                        mg.attribute = i.attribute; mg.int_attr = i.int_attr;
+                        mg.float_attr = i.float_attr; mg.ints_attr = i.ints_attr;
                         mg.comment = "dWg(moe)";
                         fn.instructions.push_back(mg);
                         g[i.operands[1]] = mg.result_id;
-                        // dWe (expert weights)
-                        auto me = MLIRInstr(MLIROp::MOE_GRAD_WE, new_temp("g"));
-                        me.operands = mx.operands;
-                        me.attribute = E; me.int_attr = i.int_attr;
-                        me.comment = "dWe(moe)";
-                        fn.instructions.push_back(me);
-                        g[i.operands[2]] = me.result_id;
+                        // dWe1 / dWe2 (expert FFN weights)
+                        auto me1 = MLIRInstr(MLIROp::MOE_GRAD_WE1, new_temp("g"));
+                        me1.operands = mx.operands;
+                        me1.attribute = i.attribute; me1.int_attr = i.int_attr;
+                        me1.float_attr = i.float_attr; me1.ints_attr = i.ints_attr;
+                        me1.comment = "dWe1(moe)";
+                        fn.instructions.push_back(me1);
+                        g[i.operands[2]] = me1.result_id;
+                        auto me2 = MLIRInstr(MLIROp::MOE_GRAD_WE2, new_temp("g"));
+                        me2.operands = mx.operands;
+                        me2.attribute = i.attribute; me2.int_attr = i.int_attr;
+                        me2.float_attr = i.float_attr; me2.ints_attr = i.ints_attr;
+                        me2.comment = "dWe2(moe)";
+                        fn.instructions.push_back(me2);
+                        g[i.operands[3]] = me2.result_id;
                         break;
                     }
                     case MLIROp::LAYER_ATTENTION: {
@@ -850,21 +881,25 @@ void MLIRCompiler::apply_pipeline_stage(const std::string& wname, MLIRValue& in,
             return;
         }
         if (ty == "MoE" || ty == "MixtureOfExperts") {
-            if (miter->second.weight_ids.size() < 2)
+            if (miter->second.weight_ids.size() < 3)
                 throw std::runtime_error(
                     "MoE layer '" + wname +
-                    "' has no materialized router/expert weights (need d_model & num_experts)");
+                    "' has no materialized router/FFN weights (need d_model & num_experts)");
             auto instr = MLIRInstr(MLIROp::LAYER_MOE, new_temp("moe"));
             instr.operands = {in.id,
                               miter->second.weight_ids[0],
-                              miter->second.weight_ids[1]};
+                              miter->second.weight_ids[1],
+                              miter->second.weight_ids[2]};
             instr.attribute = std::to_string(miter->second.num_experts);
             instr.int_attr = miter->second.emb_dim;
+            instr.float_attr = (double)miter->second.ffn_dim;
+            instr.ints_attr = {miter->second.initial_experts};
             instr.result_type = TensorType({DimExpr::dynamic(),
                                             DimExpr::constant(miter->second.emb_dim)},
                                            Dtype::Float32);
             instr.comment = "moe(" + in.id + ", experts=" +
-                            std::to_string(miter->second.num_experts) + ")";
+                            std::to_string(miter->second.num_experts) +
+                            ", ffn=" + std::to_string(miter->second.ffn_dim) + ")";
             fn.instructions.push_back(instr);
             out.id = instr.result_id;
             return;
@@ -939,7 +974,8 @@ std::string MLIRCompiler::dump(MLIRModule& module) {
                 case MLIROp::EMBEDDING_GRAD_W: oss << "ns.grad.embedding.w"; break;
                 case MLIROp::MOE_GRAD_X: oss << "ns.grad.moe.x"; break;
                 case MLIROp::MOE_GRAD_WG: oss << "ns.grad.moe.wg"; break;
-                case MLIROp::MOE_GRAD_WE: oss << "ns.grad.moe.we"; break;
+                case MLIROp::MOE_GRAD_WE1: oss << "ns.grad.moe.we1"; break;
+                case MLIROp::MOE_GRAD_WE2: oss << "ns.grad.moe.we2"; break;
                 case MLIROp::ATTENTION_GRAD_X: oss << "ns.grad.attention.x"; break;
                 case MLIROp::ATTENTION_GRAD_WQ: oss << "ns.grad.attention.wq"; break;
                 case MLIROp::ATTENTION_GRAD_WK: oss << "ns.grad.attention.wk"; break;

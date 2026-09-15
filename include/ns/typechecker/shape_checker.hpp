@@ -39,7 +39,9 @@ struct LayerRule {
     DimExpr emb_vocab; // Embedding vocab
     DimExpr emb_dim;   // Embedding dim
     DimExpr num_heads; // Attention
-    DimExpr num_experts; // MoE
+    DimExpr num_experts; // MoE capacity (compile-time slot count)
+    DimExpr ffn_dim;     // MoE expert FFN hidden width (default 4*emb_dim)
+    DimExpr initial_experts; // MoE experts active at init (default = num_experts)
     std::string activation; // activation name
     double rate = 0.0;  // Dropout rate
 

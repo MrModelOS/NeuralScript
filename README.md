@@ -89,8 +89,9 @@ gradient instructions, so they can be used in AOT training bodies:
   `lr_scale()` at each step, keeping the reference and compiled paths in parity.
   Unit-tested by `test_lr_schedule` (formula + `set_lr` round-trip).
 - **Checkpoint save/load** (`ns_save_checkpoint`, `ns_load_checkpoint`): emitted
-  in every self-contained runtime driver alongside `ns_free`. Format: 4-byte magic
-  `NSM1`, `size_t` float count, raw host-endian weights. CUDA load re-syncs the
+  in every self-contained runtime driver alongside `ns_free`. Format: 4-byte
+  magic `NSM1` (weights only) or `NSM2` (weights + MoE liveness mask, see
+  below), `size_t` float count, raw host-endian weights. CUDA load re-syncs the
   device weight buffer via `cudaMemcpy`. Verified in `test_runtime` (CPU
   round-trip) and in `test_cuda_codegen` (device re-sync through the CUDA
   attention path).
@@ -103,6 +104,46 @@ reference), `test_datamove` (programmatic embedding→matmul→transpose→conca
 reshape→layernorm), `test_dsl_datamove` (parser path for slice/index/scatter/
 concat/transpose/reshape), `test_moe` (router vs a scalar reference); each also
 `nvcc -c`-validates the emitted CUDA.
+
+## v1.3: FFN MoE experts and dynamic expert lifecycle
+
+The MoE layer now uses real **FFN experts** and supports growing/shrinking the
+live-expert set at runtime, all over a static AOT graph:
+
+- **FFN experts**: each expert is a two-layer `D → H → D` block with GELU
+  (`H = 4·D` by default, or set `ffn_dim` explicitly), with weights
+  `moe_e1_w [E, D, H]` and `moe_e2_w [E, H, D]` beside the router
+  `moe_g_w [D, E]`. Seven fused kernels (`ns_moe_fwd` +
+  `ns_moe_grad_x/wg/we1/we2`) implement forward and backward, refactorable
+  identically on CPU and CUDA:
+  `forward: out[i,j] = p · Σ_h gelu(x·We1[b])·We2[b]`,
+  `dOut → x, Wg, We1, We2` via the same recomputed routing.
+- **Live expert mask**: an `active[]` liveness byte-vector lives in the model
+  context (`moe_active` on CPU, `h_moe_a`/`d_moe_a` on CUDA). `NULL`/zero mask
+  means “all alive”; otherwise the router softmax is computed **over live
+  experts only**, so routing probabilies renormalize as experts die or are born.
+- **`initial_experts` (K0)**: compile-time attribute (`MoE(d_model: 8,
+  num_experts: 4, ffn_dim: 32, initial_experts: 1)`). The first `K0` experts
+  start alive; the rest are dormant but fully allocated in the fused graph.
+- **Expert lifecycle C ABI** (emitted only when the model has a MoE layer;
+  one MoE layer per model):
+  - `ns_expert_count(m)` — number of live experts.
+  - `ns_expert_birth(m, n)` — copy a random live expert's router column + FFN
+    slices with ±1e-2 noise into the first `n` dormant slots (up to capacity).
+  - `ns_expert_merge(m, a, b)` — average two live experts into `a`, retire `b`.
+  - `ns_expert_kill(m, k)` — retire live expert `k` (optional pre-step pruning).
+  CPU operates on `ns_model.w` directly; CUDA updates `h_w` then re-syncs the
+  `d_wb` / `d_moe_a` device buffers, so the next `ns_runtime_train_step` or
+  `ns_eval_infer` sees the new expert set immediately.
+- **NSM2 checkpoints**: `ns_save_checkpoint` now writes magic `NSM2` = raw
+  weights + `{n_layers=1, capacity, <capacity> mask bytes}` on MoE models;
+  `ns_load_checkpoint` restores both and re-syncs the GPU. Legacy `NSM1` files
+  still load (all experts assumed alive).
+- Verified by `test_moe` (FFN reference, live-only softmax with a mutated
+  mask; CPU vs naive + nvcc), `test_moe_lifecycle` (K=1 growth by birth,
+  merge/kill, NSM2 round-trip, NSM1 fallback), `test_moe_train`
+  (16/16 token→class via AOT backprop through the FFN MoE), and the MOEX net
+  in `test_cuda_codegen` (MoE training + lifecycle + checkpoint on device).
 
 ## Build
 

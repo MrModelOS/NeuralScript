@@ -365,30 +365,43 @@ extern "C" __global__ void ns_attention_grad_kernel(
   }
 }
 // Mixture-of-experts router: one thread per token. Router logits = x @ Wg with
-// a softmax over experts; the top-1 expert per token is applied to x (its [D,D]
-// matrix lives at We + e*D*D) and the result is scaled by the routing weight.
+// a softmax over LIVE experts (active null = all live, active[e]!=0 = live);
+// the top-1 live expert computes y = GELU(x @ We1) @ We2 and the output is
+// scaled by the routing weight. We1[e] is [D,H], We2[e] is [H,D].
 __global__ void ns_moe_kernel(const float* __restrict__ x, const float* __restrict__ Wg,
-                              const float* __restrict__ We, float* __restrict__ out,
-                              int M, int D, int E) {
+                              const float* __restrict__ We1, const float* __restrict__ We2,
+                              const uint8_t* __restrict__ active, float* __restrict__ out,
+                              int M, int D, int H, int E) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= M) return;
-  float lg[256];
+  float lg[256], h[256];
   int Ee = E < 256 ? E : 256;
+  int He = H < 256 ? H : 256;
   float mx = -1.0e30f;
   for (int e = 0; e < Ee; e++) {
+    if (active && !active[e]) { lg[e] = -1.0e30f; continue; }
     float a = 0.f;
     for (int k = 0; k < D; k++) a += x[i * D + k] * Wg[k * E + e];
     lg[e] = a;
     mx = fmaxf(mx, a);
   }
   float sum = 0.f;
-  for (int e = 0; e < Ee; e++) { lg[e] = expf(lg[e] - mx); sum += lg[e]; }
-  int best = 0;
-  for (int e = 1; e < Ee; e++) if (lg[e] > lg[best]) best = e;
-  float p = (sum > 0.f) ? lg[best] / sum : 0.f;
+  for (int e = 0; e < Ee; e++) {
+    if (active && !active[e]) { lg[e] = 0.f; continue; }
+    lg[e] = expf(lg[e] - mx); sum += lg[e];
+  }
+  int best = -1;
+  for (int e = 0; e < Ee; e++)
+    if (!(active && !active[e]) && (best < 0 || lg[e] > lg[best])) best = e;
+  float p = (sum > 0.f && best >= 0) ? lg[best] / sum : 0.f;
+  for (int a = 0; a < He; a++) {
+    float acc = 0.f;
+    for (int k = 0; k < D; k++) acc += x[i * D + k] * We1[best * D * H + k * H + a];
+    h[a] = 0.5f * acc * (1.f + erff(acc * 0.7071067811865476f));
+  }
   for (int j = 0; j < D; j++) {
     float a = 0.f;
-    for (int k = 0; k < D; k++) a += x[i * D + k] * We[best * D * D + k * D + j];
+    for (int b = 0; b < He; b++) a += h[b] * We2[best * H * D + b * D + j];
     out[i * D + j] = p * a;
   }
 }
@@ -498,96 +511,181 @@ __global__ void ns_embedding_grad_w_kernel(const float* __restrict__ dout,
   }
 }
 __global__ void ns_moe_grad_x_kernel(const float* __restrict__ dout, const float* __restrict__ x,
-                                     const float* __restrict__ Wg, const float* __restrict__ We,
-                                     float* __restrict__ dx, int M, int D, int E) {
+                                     const float* __restrict__ Wg, const float* __restrict__ We1,
+                                     const float* __restrict__ We2, const uint8_t* __restrict__ active,
+                                     float* __restrict__ dx, int M, int D, int H, int E) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= M) return;
-  float g[256];
+  float g[256], u[256], s[256], dpre[256], dH[256];
   int Ee = E < 256 ? E : 256;
+  int He = H < 256 ? H : 256;
   float mx = -1.0e30f;
   for (int e = 0; e < Ee; e++) {
+    if (active && !active[e]) { g[e] = -1.0e30f; continue; }
     float a = 0.f;
     for (int k = 0; k < D; k++) a += x[i * D + k] * Wg[k * E + e];
     g[e] = a;
     mx = fmaxf(mx, a);
   }
   float sum = 0.f;
-  for (int e = 0; e < Ee; e++) { g[e] = expf(g[e] - mx); sum += g[e]; }
-  int best = 0;
-  for (int e = 1; e < Ee; e++) if (g[e] > g[best]) best = e;
-  float pb = (sum > 0.f) ? g[best] / sum : 0.f;
+  for (int e = 0; e < Ee; e++) {
+    if (active && !active[e]) { g[e] = 0.f; continue; }
+    g[e] = expf(g[e] - mx); sum += g[e];
+  }
+  int best = -1;
+  for (int e = 0; e < Ee; e++)
+    if (!(active && !active[e]) && (best < 0 || g[e] > g[best])) best = e;
+  float pb = (sum > 0.f && best >= 0) ? g[best] / sum : 0.f;
+  for (int a = 0; a < He; a++) {
+    float acc = 0.f;
+    for (int k = 0; k < D; k++) acc += x[i * D + k] * We1[best * D * H + k * H + a];
+    u[a] = acc;                                    // pre-activation
+    s[a] = 0.5f * acc * (1.f + erff(acc * 0.7071067811865476f)); // gelu
+  }
+  for (int a = 0; a < He; a++) {
+    float acc = 0.f;
+    for (int j = 0; j < D; j++) acc += dout[i * D + j] * We2[best * H * D + a * D + j];
+    dpre[a] = acc;
+  }
   float dpb = 0.f;
-  for (int j = 0; j < D; j++) {
-    float a = 0.f;
-    for (int k = 0; k < D; k++) a += x[i * D + k] * We[best * D * D + k * D + j];
-    dpb += a * dout[i * D + j];
+  for (int a = 0; a < He; a++) {
+    float uu = u[a];
+    dH[a] = dpre[a] * pb * (0.5f * (1.f + erff(uu * 0.7071067811865476f)) +
+                            uu * expf(-uu * uu * 0.5f) * 0.3989422804014327f);
+    dpb += s[a] * dpre[a];
   }
   float sd = dpb * pb;
   for (int k = 0; k < D; k++) {
     float gacc = 0.f, eacc = 0.f;
     for (int e = 0; e < Ee; e++) {
-      float pe = (sum > 0.f) ? g[e] / sum : 0.f;
+      float pe = (active && !active[e]) ? 0.f : g[e] / sum;
       float dg = pe * ((e == best ? dpb : 0.f) - sd);
       gacc += dg * Wg[k * E + e];
     }
-    for (int j = 0; j < D; j++) eacc += We[best * D * D + k * D + j] * dout[i * D + j];
-    dx[i * D + k] = gacc + pb * eacc;
+    for (int a = 0; a < He; a++)
+      eacc += dH[a] * We1[best * D * H + k * H + a];
+    dx[i * D + k] = gacc + eacc;
   }
 }
 __global__ void ns_moe_grad_wg_kernel(const float* __restrict__ dout, const float* __restrict__ x,
-                                      const float* __restrict__ Wg, const float* __restrict__ We,
-                                      float* __restrict__ dWg, int M, int D, int E) {
+                                      const float* __restrict__ Wg, const float* __restrict__ We1,
+                                      const float* __restrict__ We2, const uint8_t* __restrict__ active,
+                                      float* __restrict__ dWg, int M, int D, int H, int E) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= M) return;
-  float g[256];
+  float g[256], h[256], dpre[256];
   int Ee = E < 256 ? E : 256;
+  int He = H < 256 ? H : 256;
   float mx = -1.0e30f;
   for (int e = 0; e < Ee; e++) {
+    if (active && !active[e]) { g[e] = -1.0e30f; continue; }
     float a = 0.f;
     for (int k = 0; k < D; k++) a += x[i * D + k] * Wg[k * E + e];
     g[e] = a;
     mx = fmaxf(mx, a);
   }
   float sum = 0.f;
-  for (int e = 0; e < Ee; e++) { g[e] = expf(g[e] - mx); sum += g[e]; }
-  int best = 0;
-  for (int e = 1; e < Ee; e++) if (g[e] > g[best]) best = e;
-  float pb = (sum > 0.f) ? g[best] / sum : 0.f;
-  float dpb = 0.f;
-  for (int j = 0; j < D; j++) {
-    float a = 0.f;
-    for (int k = 0; k < D; k++) a += x[i * D + k] * We[best * D * D + k * D + j];
-    dpb += a * dout[i * D + j];
+  for (int e = 0; e < Ee; e++) {
+    if (active && !active[e]) { g[e] = 0.f; continue; }
+    g[e] = expf(g[e] - mx); sum += g[e];
   }
+  int best = -1;
+  for (int e = 0; e < Ee; e++)
+    if (!(active && !active[e]) && (best < 0 || g[e] > g[best])) best = e;
+  float pb = (sum > 0.f && best >= 0) ? g[best] / sum : 0.f;
+  for (int a = 0; a < He; a++) {
+    float acc = 0.f;
+    for (int k = 0; k < D; k++) acc += x[i * D + k] * We1[best * D * H + k * H + a];
+    h[a] = 0.5f * acc * (1.f + erff(acc * 0.7071067811865476f));
+  }
+  for (int a = 0; a < He; a++) {
+    float acc = 0.f;
+    for (int j = 0; j < D; j++) acc += dout[i * D + j] * We2[best * H * D + a * D + j];
+    dpre[a] = acc;
+  }
+  float dpb = 0.f;
+  for (int a = 0; a < He; a++) dpb += h[a] * dpre[a];
   float sd = dpb * pb;
   for (int e = 0; e < Ee; e++) {
-    float pe = (sum > 0.f) ? g[e] / sum : 0.f;
+    if (active && !active[e]) continue;
+    float pe = g[e] / sum;
     float dg = pe * ((e == best ? dpb : 0.f) - sd);
     for (int k = 0; k < D; k++) atomicAdd(&dWg[k * E + e], x[i * D + k] * dg);
   }
 }
-__global__ void ns_moe_grad_we_kernel(const float* __restrict__ dout, const float* __restrict__ x,
-                                      const float* __restrict__ Wg, const float* __restrict__ We,
-                                      float* __restrict__ dWe, int M, int D, int E) {
+__global__ void ns_moe_grad_we1_kernel(const float* __restrict__ dout, const float* __restrict__ x,
+                                       const float* __restrict__ Wg, const float* __restrict__ We1,
+                                       const float* __restrict__ We2, const uint8_t* __restrict__ active,
+                                       float* __restrict__ dWe1, int M, int D, int H, int E) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= M) return;
-  float g[256];
+  float g[256], dpre[256];
   int Ee = E < 256 ? E : 256;
+  int He = H < 256 ? H : 256;
   float mx = -1.0e30f;
   for (int e = 0; e < Ee; e++) {
+    if (active && !active[e]) { g[e] = -1.0e30f; continue; }
     float a = 0.f;
     for (int k = 0; k < D; k++) a += x[i * D + k] * Wg[k * E + e];
     g[e] = a;
     mx = fmaxf(mx, a);
   }
   float sum = 0.f;
-  for (int e = 0; e < Ee; e++) { g[e] = expf(g[e] - mx); sum += g[e]; }
-  int best = 0;
-  for (int e = 1; e < Ee; e++) if (g[e] > g[best]) best = e;
-  float pb = (sum > 0.f) ? g[best] / sum : 0.f;
-  for (int k = 0; k < D; k++)
+  for (int e = 0; e < Ee; e++) {
+    if (active && !active[e]) { g[e] = 0.f; continue; }
+    g[e] = expf(g[e] - mx); sum += g[e];
+  }
+  int best = -1;
+  for (int e = 0; e < Ee; e++)
+    if (!(active && !active[e]) && (best < 0 || g[e] > g[best])) best = e;
+  float pb = (sum > 0.f && best >= 0) ? g[best] / sum : 0.f;
+  for (int a = 0; a < He; a++) {
+    float acc = 0.f;
+    for (int k = 0; k < D; k++) acc += x[i * D + k] * We1[best * D * H + k * H + a];
+    float u = acc;
+    acc = 0.f;
+    for (int j = 0; j < D; j++) acc += dout[i * D + j] * We2[best * H * D + a * D + j];
+    dpre[a] = acc;
+    float dH = dpre[a] * pb * (0.5f * (1.f + erff(u * 0.7071067811865476f)) +
+                               u * expf(-u * u * 0.5f) * 0.3989422804014327f);
+    for (int k = 0; k < D; k++)
+      atomicAdd(&dWe1[best * D * H + k * H + a], x[i * D + k] * dH);
+  }
+}
+__global__ void ns_moe_grad_we2_kernel(const float* __restrict__ dout, const float* __restrict__ x,
+                                       const float* __restrict__ Wg, const float* __restrict__ We1,
+                                       const float* __restrict__ We2, const uint8_t* __restrict__ active,
+                                       float* __restrict__ dWe2, int M, int D, int H, int E) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= M) return;
+  float g[256], h[256];
+  int Ee = E < 256 ? E : 256;
+  int He = H < 256 ? H : 256;
+  float mx = -1.0e30f;
+  for (int e = 0; e < Ee; e++) {
+    if (active && !active[e]) { g[e] = -1.0e30f; continue; }
+    float a = 0.f;
+    for (int k = 0; k < D; k++) a += x[i * D + k] * Wg[k * E + e];
+    g[e] = a;
+    mx = fmaxf(mx, a);
+  }
+  float sum = 0.f;
+  for (int e = 0; e < Ee; e++) {
+    if (active && !active[e]) { g[e] = 0.f; continue; }
+    g[e] = expf(g[e] - mx); sum += g[e];
+  }
+  int best = -1;
+  for (int e = 0; e < Ee; e++)
+    if (!(active && !active[e]) && (best < 0 || g[e] > g[best])) best = e;
+  float pb = (sum > 0.f && best >= 0) ? g[best] / sum : 0.f;
+  for (int a = 0; a < He; a++) {
+    float acc = 0.f;
+    for (int k = 0; k < D; k++) acc += x[i * D + k] * We1[best * D * H + k * H + a];
+    h[a] = 0.5f * acc * (1.f + erff(acc * 0.7071067811865476f));
+  }
+  for (int a = 0; a < He; a++)
     for (int j = 0; j < D; j++)
-      atomicAdd(&dWe[best * D * D + k * D + j], x[i * D + k] * dout[i * D + j] * pb);
+      atomicAdd(&dWe2[best * H * D + a * D + j], h[a] * pb * dout[i * D + j]);
 }
 __global__ void ns_loss_grad_kernel(const float* __restrict__ preds, const float* __restrict__ labels,
                                     float* __restrict__ d, int numel, int C) {
@@ -701,6 +799,16 @@ __global__ void ns_dropout_mul_kernel(const float* __restrict__ dIn, const float
 // here is file-scope state, so separate models never share device buffers.
 static const char kRuntimeUtils[] = R"CUDA(
 static int ns_cu_reserve(float** pp, size_t* pc, size_t bytes, int zero) {
+  if (!*pp || *pc < bytes) {
+    if (*pp) cudaFree(*pp);
+    if (bytes == 0) bytes = 1;
+    if (cudaMalloc((void**)pp, bytes) != cudaSuccess) return -1;
+    *pc = bytes;
+    if (zero) cudaMemset(*pp, 0, bytes);
+  }
+  return 0;
+}
+static int ns_cu_reserve_u8(uint8_t** pp, size_t* pc, size_t bytes, int zero) {
   if (!*pp || *pc < bytes) {
     if (*pp) cudaFree(*pp);
     if (bytes == 0) bytes = 1;

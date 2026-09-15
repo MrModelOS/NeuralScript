@@ -100,14 +100,17 @@ int main() {
         ys[i * C + 1] = cls == 1 ? 1.f : 0.f;
     }
 
-    // Weight count: emb (16*8) + gate (8*2) + experts (2*8*8) + fc (8*2) = 304
-    const size_t nw = 16 * 8 + 8 * 2 + 2 * 8 * 8 + 8 * 2;
+    // Weight count: emb (16*8) + gate (8*2) + experts e1 (2*8*32=4D ffn) +
+    // e2 (2*32*8) + fc (8*2) = 128 + 16 + 512 + 512 + 16 = 1184
+    const size_t nw = 16 * 8 + 8 * 2 + 2 * 8 * (4 * 8) + 2 * (4 * 8) * 8 + 8 * 2;
     std::vector<float> w(nw);
     unsigned s = 12345u;
     for (auto& v : w) { s = s * 1103515245u + 12345u; v = ((float)(s >> 16) / 65535.f - 0.5f) * 0.6f; }
 
     ns_model* m = ns_runtime_init(w.data(), nw);
     if (!m) return fail("init");
+
+    if (ns_expert_count(m) != 2) return fail("expert_count after init");
 
     float loss0 = -1.f;
     if (ns_objective_loss(m, xs, ys, BS, &loss0) != 0) return fail("objective(0)");

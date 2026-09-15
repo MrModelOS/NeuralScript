@@ -74,14 +74,39 @@ const ns_weight_layout* ns_model_layout(const ns_model* m);
 /* Free the model and its buffers. */
 void ns_free(ns_model* m);
 
-/* Persist the current weight blob to `path` (binary, "NSM1" magic + float
-   count + raw host-endian weights). Returns 0 on success, -1 on error. */
+/* Persist the current weight blob (and, for MoE models, the expert liveness
+   mask) to `path`. Binary format: 4-byte magic "NSM1" (weights only) or
+   "NSM2" (weights + {n_layers, capacity, mask bytes}). Returns 0 on success,
+   -1 on error. */
 int ns_save_checkpoint(const ns_model* m, const char* path);
 
-/* Restore weights from a checkpoint saved with ns_save_checkpoint. The
-   host-side copy is replaced; device weight state is re-synced on CUDA
-   backends. Returns 0 on success (including a missing/corrupt file -> -1). */
+/* Restore weights (and the MoE mask) from a checkpoint. NSM1 files load with
+   all experts alive. The host-side copy is replaced; device weight state is
+   re-synced on CUDA backends. Returns 0 on success, -1 on error. */
 int ns_load_checkpoint(ns_model* m, const char* path);
+
+/* ---- MoE expert lifecycle (present when the graph has a MoE layer) ----
+ *
+ * The capacity (compile-time constant ns_moe_cap, exposed via the weight
+ * layout: gate row [D,cap] + per-expert ffn weights) is fixed at compile
+ * time, but the LIVENESS of each expert slot is runtime state. The mask is
+ * threaded into the fused forward/backward kernels, so only live experts are
+ * routed to. Exactly one MoE layer per model is supported.
+ *
+ * birth(n): turns up to `n` currently-inactive slots live, copying the full
+ *           (gate column + both ffn matrices) of a random live expert with a
+ *           small perturbation. Returns the new live count.
+ * merge(a,b): averages the weights of live experts `a` and `b` into `a` and
+ *           deactivates `b`. Both must be live, distinct indices. Returns the
+ *           new live count.
+ * kill(k): deactivates live expert `k`. Returns the new live count.
+ * count(): number of currently live expert slots.
+ * All of these return the input count unchanged when the model has no MoE
+ * layer or the arguments are invalid. */
+size_t ns_expert_count(const ns_model* m);
+size_t ns_expert_birth(ns_model* m, int n);
+size_t ns_expert_merge(ns_model* m, int a, int b);
+size_t ns_expert_kill(ns_model* m, int k);
 
 /* ---- AOT training (present when the network defines a train() method) ----
  *

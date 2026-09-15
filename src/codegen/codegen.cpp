@@ -348,6 +348,22 @@ std::string CodeGenerator::gen_cuda(const MLIRModule& module, const CodegenOptio
         }
     }
 
+    // MoE lifecycle metadata (one MoE layer per model). Computed from the
+    // forward function's LAYER_MOE instruction + the weight layout.
+    int moe_E = 0, moe_D = 0, moe_H = 0, moe_K0 = 0;
+    size_t moe_off_g = 0, moe_off_e1 = 0, moe_off_e2 = 0;
+    for (auto& instr : fn->instructions) {
+        if (instr.op != MLIROp::LAYER_MOE || instr.operands.size() < 4) continue;
+        moe_E = instr.attribute.empty() ? 4 : std::stoi(instr.attribute);
+        moe_D = (int)instr.int_attr;
+        moe_H = (int)(instr.float_attr > 0 ? instr.float_attr : 4 * (double)instr.int_attr);
+        moe_K0 = !instr.ints_attr.empty() ? (int)instr.ints_attr[0] : moe_E;
+        if (moe_K0 <= 0 || moe_K0 > moe_E) moe_K0 = moe_E;
+        if (woff.count(instr.operands[1])) moe_off_g = woff[instr.operands[1]];
+        if (woff.count(instr.operands[2])) moe_off_e1 = woff[instr.operands[2]];
+        if (woff.count(instr.operands[3])) moe_off_e2 = woff[instr.operands[3]];
+    }
+
     // Static input/output geometry.
     int64_t in_cols = -1, out_cols = -1;
     for (auto& instr : fn->instructions) {
@@ -379,6 +395,7 @@ std::string CodeGenerator::gen_cuda(const MLIRModule& module, const CodegenOptio
         << "// Lowered function: @" << fn->name << "\n"
         << "#include <cuda_runtime.h>\n"
         << "#include <curand_kernel.h>\n"
+        << "#include <stdint.h>\n"
         << "#include <math.h>\n"
         << "#include <stdio.h>\n"
         << "#include <stdlib.h>\n"
@@ -436,6 +453,15 @@ std::string CodeGenerator::gen_cuda(const MLIRModule& module, const CodegenOptio
             << "  float* d_yl = nullptr; size_t d_yl_cap = 0;   // labels upload\n"
             << "  float* d_row = nullptr; size_t d_row_cap = 0; // CE row losses\n"
             << "  float* hrow = nullptr;  size_t hrow_cap = 0;  // CE host reduction\n";
+        if (moe_E > 0) {
+            oss << "  uint8_t* h_moe_a = nullptr; size_t h_moe_a_cap = 0; // host expert liveness\n"
+                << "  uint8_t* d_moe_a = nullptr; size_t d_moe_a_cap = 0; // device expert liveness\n"
+                << "  unsigned moe_cap = " << moe_E << "; unsigned moe_dim = " << moe_D
+                << "; unsigned moe_ffn = " << moe_H << "; unsigned moe_k0 = " << moe_K0 << ";\n"
+                << "  size_t moe_off_g = " << moe_off_g << ", moe_off_e1 = " << moe_off_e1
+                << ", moe_off_e2 = " << moe_off_e2 << ";\n"
+                << "  unsigned moe_count = 0;\n";
+        }
         for (auto& id : sorted) {
             if (ids.count(id) && ids[id].is_weight) continue;
             if (id == x_id) continue;
@@ -476,11 +502,27 @@ std::string CodeGenerator::gen_cuda(const MLIRModule& module, const CodegenOptio
             << "    cudaFree(d_yl); d_yl_cap = 0;\n"
             << "    cudaFree(d_row); d_row_cap = 0;\n"
             << "    if (hrow) { free((void*)hrow); hrow = nullptr; hrow_cap = 0; }\n";
+        if (moe_E > 0) {
+            oss << "    cudaFree(d_moe_a); d_moe_a_cap = 0;\n"
+                << "    if (h_moe_a) { free((void*)h_moe_a); h_moe_a = nullptr; h_moe_a_cap = 0; }\n";
+        }
         for (auto& s : frees) oss << s;
         oss << "  }\n"
             << "  NSContext(const NSContext&) = delete;\n"
             << "  NSContext& operator=(const NSContext&) = delete;\n"
             << "} NSContext;\n\n";
+        if (moe_E > 0)
+            oss << "// Allocate the host mask (first K0 experts live), upload it, and\n"
+                << "// keep the device copy in sync. Idempotent per context.\n"
+                << "static void ns_moe_mask_sync(NSContext* ctx) {\n"
+                << "  if (ctx->h_moe_a) return;\n"
+                << "  ctx->h_moe_a = (uint8_t*)calloc(ctx->moe_cap, 1);\n"
+                << "  ctx->h_moe_a_cap = ctx->moe_cap;\n"
+                << "  for (unsigned e = 0; e < ctx->moe_k0; e++) ctx->h_moe_a[e] = 1;\n"
+                << "  ctx->moe_count = ctx->moe_k0;\n"
+                << "  if (ns_cu_reserve_u8(&ctx->d_moe_a, &ctx->d_moe_a_cap, ctx->moe_cap, 0)) return;\n"
+                << "  cudaMemcpy(ctx->d_moe_a, ctx->h_moe_a, ctx->moe_cap, cudaMemcpyHostToDevice);\n"
+                << "}\n\n";
     }
 
     auto dbuf = [&](const string& id) -> string {
@@ -840,15 +882,18 @@ std::string CodeGenerator::gen_cuda(const MLIRModule& module, const CodegenOptio
             case MLIROp::LAYER_MOE: {
                 string x = instr.operands.size() > 0 ? instr.operands[0] : "";
                 string Wg = instr.operands.size() > 1 ? instr.operands[1] : "";
-                string We = instr.operands.size() > 2 ? instr.operands[2] : "";
+                string We1 = instr.operands.size() > 2 ? instr.operands[2] : "";
+                string We2 = instr.operands.size() > 3 ? instr.operands[3] : "";
                 int64_t D = instr.int_attr > 0 ? instr.int_attr : (ids[x].cols > 0 ? ids[x].cols : 1);
                 int E = instr.attribute.empty() ? 4 : std::stoi(instr.attribute);
+                int H = instr.float_attr > 0 ? (int)instr.float_attr : 4 * (int)D;
                 result_id = id;
-                oss << "  if (ns_cu_reserve(&ctx->d_" << id << ", &ctx->d_" << id << "_cap, (size_t)M * "
+                oss << "  ns_moe_mask_sync(ctx);\n"
+                    << "  if (ns_cu_reserve(&ctx->d_" << id << ", &ctx->d_" << id << "_cap, (size_t)M * "
                     << D << " * sizeof(float), 0)) return;\n"
                     << "  NS_LAUNCH1(ns_moe_kernel, M, " << dbuf(x) << ", " << dbuf(Wg)
-                    << ", " << dbuf(We) << ", ctx->d_" << id << ", M, " << D << ", "
-                    << E << ");\n";
+                    << ", " << dbuf(We1) << ", " << dbuf(We2) << ", ctx->d_moe_a, ctx->d_" << id
+                    << ", M, " << D << ", " << H << ", " << E << ");\n";
                 break;
             }
             default:
@@ -884,18 +929,25 @@ std::string CodeGenerator::gen_cuda(const MLIRModule& module, const CodegenOptio
             oss << "};\n";
         }
         oss << "static const ns_weight_layout ns_layout = { " << worder.size() << ", ns_desc };\n"
-            << "static const size_t ns_weight_total = " << weight_total << ";\n"
-            << "static const int64_t ns_in_cols = " << in_cols << ", ns_out_cols = " << out_cols << ";\n"
-            << "}\n\n"
-            << "extern \"C\" ns_model* ns_runtime_init(const float* weights, size_t num_floats) {\n"
+            << "static const size_t ns_weight_total = " << weight_total << ";\n";
+oss << "static const int64_t ns_in_cols = " << in_cols << ", ns_out_cols = " << out_cols << ";\n";
+        if (moe_E > 0)
+            oss << "static const size_t ns_moe_cap = " << moe_E << ", ns_moe_dim = " << moe_D
+                << ", ns_moe_ffn = " << moe_H << ", ns_moe_k0 = " << moe_K0
+                << ", ns_moe_off_g = " << moe_off_g << ", ns_moe_off_e1 = " << moe_off_e1
+                << ", ns_moe_off_e2 = " << moe_off_e2 << ";\n";
+        oss << "}\n\n";
+        oss << "extern \"C\" ns_model* ns_runtime_init(const float* weights, size_t num_floats) {\n"
             << "    if (num_floats != ns_weight_total) return nullptr;\n"
             << "    float* h_w = new float[ns_weight_total];\n"
             << "    NSContext* ctx = new NSContext();\n"
             << "    if (!h_w || !ctx) { delete[] h_w; delete ctx; return nullptr; }\n"
             << "    std::memcpy(h_w, weights, ns_weight_total * sizeof(float));\n"
             << "    if (ns_cu_reserve(&ctx->d_wb, &ctx->d_wb_cap, ns_weight_total * sizeof(float), 0)) { delete[] h_w; delete ctx; return nullptr; }\n"
-            << "    cudaMemcpy(ctx->d_wb, weights, ns_weight_total * sizeof(float), cudaMemcpyHostToDevice);\n"
-            << "    ns_model* m = new ns_model{ h_w, ctx, ns_weight_total };\n"
+            << "    cudaMemcpy(ctx->d_wb, weights, ns_weight_total * sizeof(float), cudaMemcpyHostToDevice);\n";
+        if (moe_E > 0)
+            oss << "    ns_moe_mask_sync(ctx);\n";
+        oss << "    ns_model* m = new ns_model{ h_w, ctx, ns_weight_total };\n"
             << "    if (!m) { delete[] h_w; delete ctx; return nullptr; }\n"
             << "    return m;\n"
             << "}\n\n"
@@ -924,19 +976,29 @@ std::string CodeGenerator::gen_cuda(const MLIRModule& module, const CodegenOptio
             << "extern \"C\" void ns_free(ns_model* m) {\n"
             << "    if (!m) return; delete m->ctx; delete[] m->h_w; delete m;\n"
             << "}\n\n"
-            << "// Persist / restore the weight blob. Format: 4-byte magic \"NSM1\",\n"
-            << "// size_t float count, then the raw weights (host-endian).\n"
+            << "// Persist / restore the weight blob + the MoE liveness mask. Format:\n"
+            << "// 4-byte magic \"NSM2\", size_t float count, raw weights, then (MoE\n"
+            << "// models) uint32 n_layers, uint32 capacity, <capacity> mask bytes.\n"
+            << "// Legacy \"NSM1\" files (weights only) load with all experts alive.\n"
             << "extern \"C\" int ns_save_checkpoint(const ns_model* m, const char* path) {\n"
             << "    if (!m || !m->h_w || !path) return -1;\n"
             << "    FILE* fp = fopen(path, \"wb\");\n"
             << "    if (!fp) return -1;\n"
-            << "    const unsigned magic = 0x4E534D31u; /* \"NSM1\" */\n"
+            << "    const unsigned magic = 0x4E534D32u; /* \"NSM2\" */\n"
             << "    if (fwrite(&magic, sizeof(magic), 1, fp) != 1 ||\n"
             << "        fwrite(&ns_weight_total, sizeof(ns_weight_total), 1, fp) != 1 ||\n"
             << "        fwrite(m->h_w, sizeof(float), ns_weight_total, fp) != ns_weight_total) {\n"
             << "        fclose(fp); return -1;\n"
-            << "    }\n"
-            << "    fclose(fp); return 0;\n"
+            << "    }\n";
+        if (moe_E > 0)
+            oss << "    if (!m->ctx->h_moe_a) { fclose(fp); return -1; }\n"
+                << "    { const unsigned n_layers = 1U;\n"
+                << "      if (fwrite(&n_layers, sizeof(n_layers), 1, fp) != 1 ||\n"
+                << "          fwrite(&ns_moe_cap, sizeof(ns_moe_cap), 1, fp) != 1 ||\n"
+                << "          fwrite(m->ctx->h_moe_a, 1, ns_moe_cap, fp) != ns_moe_cap) {\n"
+                << "          fclose(fp); return -1;\n"
+                << "      } }\n";
+        oss << "    fclose(fp); return 0;\n"
             << "}\n\n"
             << "extern \"C\" int ns_load_checkpoint(ns_model* m, const char* path) {\n"
             << "    if (!m || !m->ctx || !m->h_w || !path) return -1;\n"
@@ -945,14 +1007,98 @@ std::string CodeGenerator::gen_cuda(const MLIRModule& module, const CodegenOptio
             << "    unsigned magic = 0; size_t n = 0;\n"
             << "    if (fread(&magic, sizeof(magic), 1, fp) != 1 ||\n"
             << "        fread(&n, sizeof(n), 1, fp) != 1 ||\n"
-            << "        magic != 0x4E534D31u || n != ns_weight_total ||\n"
+            << "        (magic != 0x4E534D31u && magic != 0x4E534D32u) || n != ns_weight_total ||\n"
             << "        fread(m->h_w, sizeof(float), n, fp) != n) {\n"
             << "        fclose(fp); return -1;\n"
-            << "    }\n"
-            << "    fclose(fp);\n"
+            << "    }\n";
+        if (moe_E > 0)
+            oss << "    ns_moe_mask_sync(m->ctx);\n"
+                << "    if (magic == 0x4E534D32u) {\n"
+                << "      unsigned n_layers = 0; size_t cap = 0;\n"
+                << "      if (fread(&n_layers, sizeof(n_layers), 1, fp) != 1 ||\n"
+                << "          fread(&cap, sizeof(cap), 1, fp) != 1 ||\n"
+                << "          n_layers != 1U || cap != ns_moe_cap ||\n"
+                << "          fread(m->ctx->h_moe_a, 1, cap, fp) != cap) {\n"
+                << "          fclose(fp); return -1;\n"
+                << "      }\n"
+                << "    } else {\n"
+                << "      memset(m->ctx->h_moe_a, 0, ns_moe_cap);\n"
+                << "      for (size_t e = 0; e < ns_moe_k0; e++) m->ctx->h_moe_a[e] = 1;\n"
+                << "    }\n"
+                << "    m->ctx->moe_count = 0;\n"
+                << "    for (size_t e = 0; e < ns_moe_cap; e++) m->ctx->moe_count += m->ctx->h_moe_a[e];\n"
+                << "    cudaMemcpy(m->ctx->d_moe_a, m->ctx->h_moe_a, ns_moe_cap, cudaMemcpyHostToDevice);\n";
+        oss << "    fclose(fp);\n"
             << "    cudaMemcpy(m->ctx->d_wb, m->h_w, ns_weight_total * sizeof(float), cudaMemcpyHostToDevice);\n"
             << "    return 0;\n"
-            << "}\n";
+            << "}\n\n";
+        if (moe_E > 0) {
+            oss << "// ---- MoE expert lifecycle (capacity is compile-time; liveness\n"
+                << "//      is runtime state in the context) ----\n"
+                << "extern \"C\" size_t ns_expert_count(const ns_model* m) {\n"
+                << "    if (!m || !m->ctx) return 0;\n"
+                << "    return m->ctx->moe_count;\n"
+                << "}\n\n"
+                << "extern \"C\" size_t ns_expert_birth(ns_model* m, int n) {\n"
+                << "    if (!m || !m->ctx || !m->h_w || n <= 0) return m && m->ctx ? m->ctx->moe_count : 0;\n"
+                << "    ns_moe_mask_sync(m->ctx);\n"
+                << "    if (m->ctx->moe_count >= ns_moe_cap) return m->ctx->moe_count;\n"
+                << "    int src = -1;\n"
+                << "    for (unsigned e = 0; e < ns_moe_cap && src < 0; e++)\n"
+                << "      if (m->ctx->h_moe_a[e]) src = (int)e;\n"
+                << "    if (src < 0) return 0;\n"
+                << "    const size_t s1 = (size_t)src * ns_moe_dim * ns_moe_ffn;\n"
+                << "    const size_t s2 = (size_t)src * ns_moe_ffn * ns_moe_dim;\n"
+                << "    for (unsigned e = 0; e < ns_moe_cap && n > 0; e++) {\n"
+                << "      if (m->ctx->h_moe_a[e]) continue;\n"
+                << "      const size_t g2 = (size_t)e * ns_moe_dim * ns_moe_ffn;\n"
+                << "      const size_t g3 = (size_t)e * ns_moe_ffn * ns_moe_dim;\n"
+                << "      for (size_t k = 0; k < ns_moe_dim; k++)\n"
+                << "        m->h_w[ns_moe_off_g + k * ns_moe_cap + e] = m->h_w[ns_moe_off_g + k * ns_moe_cap + (size_t)src];\n"
+                << "      for (size_t q = 0; q < ns_moe_dim * ns_moe_ffn; q++)\n"
+                << "        m->h_w[ns_moe_off_e1 + g2 + q] = m->h_w[ns_moe_off_e1 + s1 + q];\n"
+                << "      for (size_t q = 0; q < ns_moe_ffn * ns_moe_dim; q++)\n"
+                << "        m->h_w[ns_moe_off_e2 + g3 + q] = m->h_w[ns_moe_off_e2 + s2 + q];\n"
+                << "      m->ctx->h_moe_a[e] = 1;\n"
+                << "      m->ctx->moe_count++;\n"
+                << "      n--;\n"
+                << "    }\n"
+                << "    cudaMemcpy(m->ctx->d_wb, m->h_w, ns_weight_total * sizeof(float), cudaMemcpyHostToDevice);\n"
+                << "    cudaMemcpy(m->ctx->d_moe_a, m->ctx->h_moe_a, ns_moe_cap, cudaMemcpyHostToDevice);\n"
+                << "    return m->ctx->moe_count;\n"
+                << "}\n\n"
+                << "extern \"C\" size_t ns_expert_merge(ns_model* m, int a, int b) {\n"
+                << "    if (!m || !m->ctx || !m->h_w || a < 0 || b < 0 || a == b ||\n"
+                << "        a >= (int)ns_moe_cap || b >= (int)ns_moe_cap ||\n"
+                << "        !m->ctx->h_moe_a[a] || !m->ctx->h_moe_a[b])\n"
+                << "        return m && m->ctx ? m->ctx->moe_count : 0;\n"
+                << "    const size_t s1 = (size_t)a * ns_moe_dim * ns_moe_ffn;\n"
+                << "    const size_t s1b = (size_t)b * ns_moe_dim * ns_moe_ffn;\n"
+                << "    const size_t t2 = (size_t)a * ns_moe_ffn * ns_moe_dim;\n"
+                << "    const size_t t2b = (size_t)b * ns_moe_ffn * ns_moe_dim;\n"
+                << "    for (size_t k = 0; k < ns_moe_dim; k++)\n"
+                << "      m->h_w[ns_moe_off_g + k * ns_moe_cap + (size_t)a] =\n"
+                << "        0.5f * (m->h_w[ns_moe_off_g + k * ns_moe_cap + (size_t)a] +\n"
+                << "                m->h_w[ns_moe_off_g + k * ns_moe_cap + (size_t)b]);\n"
+                << "    for (size_t q = 0; q < ns_moe_dim * ns_moe_ffn; q++)\n"
+                << "      m->h_w[ns_moe_off_e1 + s1 + q] = 0.5f * (m->h_w[ns_moe_off_e1 + s1 + q] + m->h_w[ns_moe_off_e1 + s1b + q]);\n"
+                << "    for (size_t q = 0; q < ns_moe_ffn * ns_moe_dim; q++)\n"
+                << "      m->h_w[ns_moe_off_e2 + t2 + q] = 0.5f * (m->h_w[ns_moe_off_e2 + t2 + q] + m->h_w[ns_moe_off_e2 + t2b + q]);\n"
+                << "    m->ctx->h_moe_a[b] = 0;\n"
+                << "    m->ctx->moe_count--;\n"
+                << "    cudaMemcpy(m->ctx->d_wb, m->h_w, ns_weight_total * sizeof(float), cudaMemcpyHostToDevice);\n"
+                << "    cudaMemcpy(m->ctx->d_moe_a, m->ctx->h_moe_a, ns_moe_cap, cudaMemcpyHostToDevice);\n"
+                << "    return m->ctx->moe_count;\n"
+                << "}\n\n"
+                << "extern \"C\" size_t ns_expert_kill(ns_model* m, int k) {\n"
+                << "    if (!m || !m->ctx || k < 0 || k >= (int)ns_moe_cap || !m->ctx->h_moe_a[k])\n"
+                << "        return m && m->ctx ? m->ctx->moe_count : 0;\n"
+                << "    m->ctx->h_moe_a[k] = 0;\n"
+                << "    m->ctx->moe_count--;\n"
+                << "    cudaMemcpy(m->ctx->d_moe_a, m->ctx->h_moe_a, ns_moe_cap, cudaMemcpyHostToDevice);\n"
+                << "    return m->ctx->moe_count;\n"
+                << "}\n\n";
+        }
 
         if (tfn) {
             oss << "\n// ---- CUDA training core (forward + backward + optimizer on device) ----\n"
@@ -1011,6 +1157,11 @@ std::string CodeGenerator::gen_cpu(const MLIRModule& module, const CodegenOption
           << "extern \"C\" void " << opts.function_name << "(const float*, const float*, float*, size_t) {}\n";
         return o.str();
     }
+
+    // ---- Does the network contain a MoE layer? (threads the active-mask) ----
+    bool have_moe = false;
+    for (auto& instr : fn->instructions)
+        if (instr.op == MLIROp::LAYER_MOE) { have_moe = true; break; }
 
     // ---- Per-id metadata. ----
     struct IdInfo {
@@ -1080,6 +1231,7 @@ std::string CodeGenerator::gen_cpu(const MLIRModule& module, const CodegenOption
     oss << "// Generated by NeuralScript compiler (CPU reference)\n"
         << "// Lowered function: @" << fn->name << "\n"
         << "#include <cstddef>\n"
+        << "#include <cstdint>\n"
         << "#include <cmath>\n"
         << "#include <cstring>\n"
         << "#include <cstdio>\n"
@@ -1228,95 +1380,199 @@ std::string CodeGenerator::gen_cpu(const MLIRModule& module, const CodegenOption
         << "  }\n"
         << "}\n\n";
 
-    oss << "// MoE backward: recompute router/expert routing and contribute to dx.\n"
+    oss << "// MoE backward (FFN experts): recompute router/liveness and route\n"
+        << "// gradients into dx. gate [D,E], expert1 [E,D,H], expert2 [E,H,D].\n"
+        << "// `active` may be null (all live); else active[e]!=0 means live.\n"
         << "static void ns_moe_grad_x(const float* dout, const float* x,\n"
-        << "                         const float* Wg, const float* We, float* dx,\n"
-        << "                         int64_t M, int64_t D, int64_t E) {\n"
-        << "  std::vector<float> lg((size_t)E), p((size_t)E);\n"
+        << "                         const float* Wg, const float* We1, const float* We2,\n"
+        << "                         const uint8_t* active, float* dx,\n"
+        << "                         int64_t M, int64_t D, int64_t H, int64_t E) {\n"
+        << "  std::vector<float> lg((size_t)E), p((size_t)E), h((size_t)H), dpre2((size_t)H), dH((size_t)H);\n"
+        << "  auto live = [&](int64_t e)->bool { return !active || active[(size_t)e] != 0; };\n"
         << "  for (int64_t i = 0; i < M; i++) {\n"
-        << "    float mx = -1.0e30f;\n"
+        << "    float mx = -1.0e30f, sum = 0.f, pb = 0.f;\n"
+        << "    int64_t best = -1;\n"
         << "    for (int64_t e = 0; e < E; e++) {\n"
         << "      float a = 0.f;\n"
         << "      for (int64_t k = 0; k < D; k++) a += x[i*D+k] * Wg[k*E+e];\n"
         << "      lg[(size_t)e] = a;\n"
-        << "      if (a > mx) mx = a;\n"
+        << "      if (live(e) && a > mx) mx = a;\n"
         << "    }\n"
-        << "    float sum = 0.f, pb = 0.f; int64_t best = 0;\n"
-        << "    for (int64_t e = 0; e < E; e++) { lg[(size_t)e] = expf(lg[(size_t)e] - mx); sum += lg[(size_t)e]; }\n"
-        << "    for (int64_t e = 1; e < E; e++) if (lg[(size_t)e] > lg[(size_t)best]) best = e;\n"
-        << "    if (sum > 0.f) { for (int64_t e = 0; e < E; e++) p[(size_t)e] = lg[(size_t)e] / sum; pb = p[(size_t)best]; }\n"
-        << "    float dpb = 0.f;\n"
-        << "    for (int64_t j = 0; j < D; j++) {\n"
-        << "      float a = 0.f;\n"
-        << "      for (int64_t k = 0; k < D; k++) a += x[i*D+k] * We[best*D*D + k*D + j];\n"
-        << "      dpb += a * dout[i*D+j];\n"
-        << "    }\n"
-        << "    float sd = dpb * pb;\n"
         << "    for (int64_t e = 0; e < E; e++) {\n"
-        << "      float dg = p[(size_t)e] * ((e == best ? dpb : 0.f) - sd);\n"
+        << "      if (!live(e)) { p[(size_t)e] = 0.f; continue; }\n"
+        << "      lg[(size_t)e] = expf(lg[(size_t)e] - mx);\n"
+        << "      sum += lg[(size_t)e];\n"
+        << "      if (best < 0 || lg[(size_t)e] > lg[(size_t)best]) best = e;\n"
+        << "    }\n"
+        << "    if (sum > 0.f) {\n"
+        << "      for (int64_t e = 0; e < E; e++) p[(size_t)e] = live(e) ? lg[(size_t)e]/sum : 0.f;\n"
+        << "      pb = p[(size_t)best];\n"
+        << "    }\n"
+        << "    for (int64_t a = 0; a < H; a++) {\n"
+        << "      float acc = 0.f;\n"
+        << "      for (int64_t k = 0; k < D; k++) acc += x[i*D+k] * We1[best*D*H + k*H + a];\n"
+        << "      h[(size_t)a] = acc;\n"
+        << "    }\n"
+        << "    for (int64_t a = 0; a < H; a++) {\n"
+        << "      float acc = 0.f;\n"
+        << "      for (int64_t j = 0; j < D; j++) acc += dout[i*D+j] * We2[best*H*D + a*D + j];\n"
+        << "      dpre2[(size_t)a] = acc;\n"
+        << "    }\n"
+        << "    float dpb = 0.f;\n"
+        << "    for (int64_t a = 0; a < H; a++) {\n"
+        << "      const float u = h[(size_t)a];\n"
+        << "      const float ga = 0.5f*u*(1.f + erff(u*0.7071067811865476f));       /* gelu */\n"
+        << "      const float gd = 0.5f*(1.f + erff(u*0.7071067811865476f))\n"
+        << "                        + u*expf(-u*u*0.5f)*0.3989422804014327f;         /* gelu' */\n"
+        << "      dpb += ga * dpre2[(size_t)a];\n"
+        << "      dH[(size_t)a] = dpre2[(size_t)a] * pb * gd;\n"
+        << "    }\n"
+        << "    const float sd = dpb * pb;\n"
+        << "    for (int64_t e = 0; e < E; e++) {\n"
+        << "      const float dg = p[(size_t)e] * ((e == best ? dpb : 0.f) - sd);\n"
         << "      for (int64_t k = 0; k < D; k++) dx[i*D+k] += dg * Wg[k*E+e];\n"
         << "    }\n"
         << "    for (int64_t k = 0; k < D; k++) {\n"
         << "      float acc = 0.f;\n"
-        << "      for (int64_t j = 0; j < D; j++) acc += We[best*D*D + k*D + j] * dout[i*D+j];\n"
-        << "      dx[i*D+k] += pb * acc;\n"
+        << "      for (int64_t a = 0; a < H; a++) acc += dH[(size_t)a] * We1[best*D*H + k*H + a];\n"
+        << "      dx[i*D+k] += acc;\n"
         << "    }\n"
         << "  }\n"
         << "}\n\n";
 
-    oss << "// MoE router-weight gradient dWg[D,E]: dWg[k,e] += x[i,k] * dlg[i,e].\n"
+    oss << "// MoE router-weight gradient dWg[D,E]: dWg[k,e] += x[i,k] * dg[i,e].\n"
         << "static void ns_moe_grad_wg(const float* dout, const float* x,\n"
-        << "                           const float* Wg, const float* We, float* dWg,\n"
-        << "                           int64_t M, int64_t D, int64_t E) {\n"
+        << "                           const float* Wg, const float* We1, const float* We2,\n"
+        << "                           const uint8_t* active, float* dWg,\n"
+        << "                           int64_t M, int64_t D, int64_t H, int64_t E) {\n"
         << "  for (int64_t k = 0; k < D*E; k++) dWg[k] = 0.f;\n"
-        << "  std::vector<float> lg((size_t)E), p((size_t)E);\n"
+        << "  std::vector<float> lg((size_t)E), p((size_t)E), h((size_t)H), dpre2((size_t)H);\n"
+        << "  auto live = [&](int64_t e)->bool { return !active || active[(size_t)e] != 0; };\n"
         << "  for (int64_t i = 0; i < M; i++) {\n"
-        << "    float mx = -1.0e30f;\n"
+        << "    float mx = -1.0e30f, sum = 0.f, pb = 0.f;\n"
+        << "    int64_t best = -1;\n"
         << "    for (int64_t e = 0; e < E; e++) {\n"
         << "      float a = 0.f;\n"
         << "      for (int64_t k = 0; k < D; k++) a += x[i*D+k] * Wg[k*E+e];\n"
         << "      lg[(size_t)e] = a;\n"
-        << "      if (a > mx) mx = a;\n"
+        << "      if (live(e) && a > mx) mx = a;\n"
         << "    }\n"
-        << "    float sum = 0.f, pb = 0.f; int64_t best = 0;\n"
-        << "    for (int64_t e = 0; e < E; e++) { lg[(size_t)e] = expf(lg[(size_t)e] - mx); sum += lg[(size_t)e]; }\n"
-        << "    for (int64_t e = 1; e < E; e++) if (lg[(size_t)e] > lg[(size_t)best]) best = e;\n"
-        << "    if (sum > 0.f) { for (int64_t e = 0; e < E; e++) p[(size_t)e] = lg[(size_t)e] / sum; pb = p[(size_t)best]; }\n"
-        << "    float dpb = 0.f;\n"
-        << "    for (int64_t j = 0; j < D; j++) {\n"
-        << "      float a = 0.f;\n"
-        << "      for (int64_t k = 0; k < D; k++) a += x[i*D+k] * We[best*D*D + k*D + j];\n"
-        << "      dpb += a * dout[i*D+j];\n"
-        << "    }\n"
-        << "    float sd = dpb * pb;\n"
         << "    for (int64_t e = 0; e < E; e++) {\n"
-        << "      float dg = p[(size_t)e] * ((e == best ? dpb : 0.f) - sd);\n"
+        << "      if (!live(e)) { p[(size_t)e] = 0.f; continue; }\n"
+        << "      lg[(size_t)e] = expf(lg[(size_t)e] - mx);\n"
+        << "      sum += lg[(size_t)e];\n"
+        << "      if (best < 0 || lg[(size_t)e] > lg[(size_t)best]) best = e;\n"
+        << "    }\n"
+        << "    if (sum > 0.f)\n"
+        << "      for (int64_t e = 0; e < E; e++) p[(size_t)e] = live(e) ? lg[(size_t)e]/sum : 0.f;\n"
+        << "    pb = best >= 0 ? p[(size_t)best] : 0.f;\n"
+        << "    if (best >= 0) {\n"
+        << "      for (int64_t a = 0; a < H; a++) {\n"
+        << "        float acc = 0.f;\n"
+        << "        for (int64_t k = 0; k < D; k++) acc += x[i*D+k] * We1[best*D*H + k*H + a];\n"
+        << "        h[(size_t)a] = 0.5f*acc*(1.f + erff(acc*0.7071067811865476f));\n"
+        << "      }\n"
+        << "      for (int64_t a = 0; a < H; a++) {\n"
+        << "        float acc = 0.f;\n"
+        << "        for (int64_t j = 0; j < D; j++) acc += dout[i*D+j] * We2[best*H*D + a*D + j];\n"
+        << "        dpre2[(size_t)a] = acc;\n"
+        << "      }\n"
+        << "    }\n"
+        << "    float dpb = 0.f;\n"
+        << "    for (int64_t a = 0; a < H; a++) dpb += h[(size_t)a] * dpre2[(size_t)a];\n"
+        << "    const float sd = dpb * pb;\n"
+        << "    for (int64_t e = 0; e < E; e++) {\n"
+        << "      const float dg = p[(size_t)e] * ((e == best ? dpb : 0.f) - sd);\n"
         << "      for (int64_t k = 0; k < D; k++) dWg[k*E+e] += x[i*D+k] * dg;\n"
         << "    }\n"
         << "  }\n"
         << "}\n\n";
 
-    oss << "// MoE expert-weight gradient dWe[E,D,D]: dWe[best,:,:] += x^T @ dz.\n"
-        << "static void ns_moe_grad_we(const float* dout, const float* x,\n"
-        << "                           const float* Wg, const float* We, float* dWe,\n"
-        << "                           int64_t M, int64_t D, int64_t E) {\n"
-        << "  for (int64_t k = 0; k < (int64_t)E*D*D; k++) dWe[k] = 0.f;\n"
-        << "  std::vector<float> lg((size_t)E), p((size_t)E);\n"
+    oss << "// MoE expert-1 gradient dWe1[E,D,H] += (x^T @ dH) on the routed expert.\n"
+        << "static void ns_moe_grad_we1(const float* dout, const float* x,\n"
+        << "                            const float* Wg, const float* We1, const float* We2,\n"
+        << "                            const uint8_t* active, float* dWe1,\n"
+        << "                            int64_t M, int64_t D, int64_t H, int64_t E) {\n"
+        << "  for (int64_t k = 0; k < (int64_t)E*D*H; k++) dWe1[k] = 0.f;\n"
+        << "  std::vector<float> lg((size_t)E), p((size_t)E), h((size_t)H), dpre2((size_t)H);\n"
+        << "  auto live = [&](int64_t e)->bool { return !active || active[(size_t)e] != 0; };\n"
         << "  for (int64_t i = 0; i < M; i++) {\n"
-        << "    float mx = -1.0e30f;\n"
+        << "    float mx = -1.0e30f, sum = 0.f, pb = 0.f;\n"
+        << "    int64_t best = -1;\n"
         << "    for (int64_t e = 0; e < E; e++) {\n"
         << "      float a = 0.f;\n"
         << "      for (int64_t k = 0; k < D; k++) a += x[i*D+k] * Wg[k*E+e];\n"
         << "      lg[(size_t)e] = a;\n"
-        << "      if (a > mx) mx = a;\n"
+        << "      if (live(e) && a > mx) mx = a;\n"
         << "    }\n"
-        << "    float sum = 0.f, pb = 0.f; int64_t best = 0;\n"
-        << "    for (int64_t e = 0; e < E; e++) { lg[(size_t)e] = expf(lg[(size_t)e] - mx); sum += lg[(size_t)e]; }\n"
-        << "    for (int64_t e = 1; e < E; e++) if (lg[(size_t)e] > lg[(size_t)best]) best = e;\n"
-        << "    if (sum > 0.f) pb = lg[(size_t)best] / sum;\n"
-        << "    for (int64_t k = 0; k < D; k++)\n"
-        << "      for (int64_t j = 0; j < D; j++)\n"
-        << "        dWe[best*D*D + k*D + j] += x[i*D+k] * dout[i*D+j] * pb;\n"
+        << "    for (int64_t e = 0; e < E; e++) {\n"
+        << "      if (!live(e)) { p[(size_t)e] = 0.f; continue; }\n"
+        << "      lg[(size_t)e] = expf(lg[(size_t)e] - mx);\n"
+        << "      sum += lg[(size_t)e];\n"
+        << "      if (best < 0 || lg[(size_t)e] > lg[(size_t)best]) best = e;\n"
+        << "    }\n"
+        << "    if (sum > 0.f)\n"
+        << "      for (int64_t e = 0; e < E; e++) p[(size_t)e] = live(e) ? lg[(size_t)e]/sum : 0.f;\n"
+        << "    pb = best >= 0 ? p[(size_t)best] : 0.f;\n"
+        << "    if (best >= 0) {\n"
+        << "      for (int64_t a = 0; a < H; a++) {\n"
+        << "        float acc = 0.f;\n"
+        << "        for (int64_t k = 0; k < D; k++) acc += x[i*D+k] * We1[best*D*H + k*H + a];\n"
+        << "        h[(size_t)a] = acc;\n"
+        << "      }\n"
+        << "      for (int64_t a = 0; a < H; a++) {\n"
+        << "        float acc = 0.f;\n"
+        << "        for (int64_t j = 0; j < D; j++) acc += dout[i*D+j] * We2[best*H*D + a*D + j];\n"
+        << "        dpre2[(size_t)a] = acc;\n"
+        << "      }\n"
+        << "      for (int64_t a = 0; a < H; a++) {\n"
+        << "        const float u = h[(size_t)a];\n"
+        << "        const float gd = 0.5f*(1.f + erff(u*0.7071067811865476f))\n"
+        << "                          + u*expf(-u*u*0.5f)*0.3989422804014327f;\n"
+        << "        const float dH = dpre2[(size_t)a] * pb * gd;\n"
+        << "        for (int64_t k = 0; k < D; k++)\n"
+        << "          dWe1[best*D*H + k*H + a] += x[i*D+k] * dH;\n"
+        << "      }\n"
+        << "    }\n"
+        << "  }\n"
+        << "}\n\n";
+
+    oss << "// MoE expert-2 gradient dWe2[E,H,D] += (h^T @ dout) * pb on routed expert.\n"
+        << "static void ns_moe_grad_we2(const float* dout, const float* x,\n"
+        << "                            const float* Wg, const float* We1, const float* We2,\n"
+        << "                            const uint8_t* active, float* dWe2,\n"
+        << "                            int64_t M, int64_t D, int64_t H, int64_t E) {\n"
+        << "  for (int64_t k = 0; k < (int64_t)E*H*D; k++) dWe2[k] = 0.f;\n"
+        << "  std::vector<float> lg((size_t)E), p((size_t)E), h((size_t)H);\n"
+        << "  auto live = [&](int64_t e)->bool { return !active || active[(size_t)e] != 0; };\n"
+        << "  for (int64_t i = 0; i < M; i++) {\n"
+        << "    float mx = -1.0e30f, sum = 0.f, pb = 0.f;\n"
+        << "    int64_t best = -1;\n"
+        << "    for (int64_t e = 0; e < E; e++) {\n"
+        << "      float a = 0.f;\n"
+        << "      for (int64_t k = 0; k < D; k++) a += x[i*D+k] * Wg[k*E+e];\n"
+        << "      lg[(size_t)e] = a;\n"
+        << "      if (live(e) && a > mx) mx = a;\n"
+        << "    }\n"
+        << "    for (int64_t e = 0; e < E; e++) {\n"
+        << "      if (!live(e)) { p[(size_t)e] = 0.f; continue; }\n"
+        << "      lg[(size_t)e] = expf(lg[(size_t)e] - mx);\n"
+        << "      sum += lg[(size_t)e];\n"
+        << "      if (best < 0 || lg[(size_t)e] > lg[(size_t)best]) best = e;\n"
+        << "    }\n"
+        << "    if (sum > 0.f)\n"
+        << "      for (int64_t e = 0; e < E; e++) p[(size_t)e] = live(e) ? lg[(size_t)e]/sum : 0.f;\n"
+        << "    pb = best >= 0 ? p[(size_t)best] : 0.f;\n"
+        << "    if (best >= 0) {\n"
+        << "      for (int64_t a = 0; a < H; a++) {\n"
+        << "        float acc = 0.f;\n"
+        << "        for (int64_t k = 0; k < D; k++) acc += x[i*D+k] * We1[best*D*H + k*H + a];\n"
+        << "        h[(size_t)a] = 0.5f*acc*(1.f + erff(acc*0.7071067811865476f));\n"
+        << "      }\n"
+        << "      for (int64_t a = 0; a < H; a++)\n"
+        << "        for (int64_t j = 0; j < D; j++)\n"
+        << "          dWe2[best*H*D + a*D + j] += h[(size_t)a] * pb * dout[i*D+j];\n"
+        << "    }\n"
         << "  }\n"
         << "}\n\n";
 
@@ -1649,29 +1905,38 @@ std::string CodeGenerator::gen_cpu(const MLIRModule& module, const CodegenOption
         << "}\n\n";
 
     oss << "// MIXTURE-OF-EXPERTS (fused router + top-1 dispatch + weighted combine).\n"
-        << "// x[M,D]  Wg[D,E]  We[E,D,D]  →  out[M,D]\n"
-        << "// Router logits = x @ Wg, softmax over experts, per token the top-1\n"
-        << "// expert is selected and its weight matrix is applied to x, scaled by\n"
-        << "// the (softmaxed) routing probability.\n"
-        << "static void ns_moe_fwd(const float* x, const float* Wg, const float* We,\n"
-        << "                      float* out, int64_t M, int64_t D, int64_t E) {\n"
-        << "  std::vector<float> lg((size_t)E);\n"
+        << "// x[M,D]  Wg[D,E]  We1[E,D,H]  We2[E,H,D]  →  out[M,D]\n"
+        << "// Router logits = x @ Wg, softmax over LIVE experts only, per token the\n"
+        << "// top-1 live expert computes y = GELU(x @ We1) @ We2, scaled by the\n"
+        << "// (softmaxed) routing probability. `active` may be null (all live);\n"
+        << "// otherwise active[e]!=0 means expert e is live.\n"
+        << "static void ns_moe_fwd(const float* x, const float* Wg, const float* We1, const float* We2,\n"
+        << "                      const uint8_t* active, float* out,\n"
+        << "                      int64_t M, int64_t D, int64_t H, int64_t E) {\n"
+        << "  std::vector<float> lg((size_t)E), h((size_t)H);\n"
+        << "  auto live = [&](int64_t e)->bool { return !active || active[(size_t)e] != 0; };\n"
         << "  for (int64_t i = 0; i < M; i++) {\n"
-        << "    float mx = -1.0e30f;\n"
+        << "    float mx = -1.0e30f, sum = 0.f;\n"
         << "    for (int64_t e = 0; e < E; e++) {\n"
         << "      float a = 0.f;\n"
         << "      for (int64_t k = 0; k < D; k++) a += x[i*D+k] * Wg[k*E+e];\n"
         << "      lg[(size_t)e] = a;\n"
-        << "      if (a > mx) mx = a;\n"
+        << "      if (live(e) && a > mx) mx = a;\n"
         << "    }\n"
-        << "    float sum = 0.f;\n"
-        << "    for (int64_t e = 0; e < E; e++) { lg[(size_t)e] = expf(lg[(size_t)e] - mx); sum += lg[(size_t)e]; }\n"
-        << "    int64_t best = 0;\n"
-        << "    for (int64_t e = 1; e < E; e++) if (lg[(size_t)e] > lg[(size_t)best]) best = e;\n"
-        << "    float p = (sum > 0.f) ? lg[(size_t)best] / sum : 0.f;\n"
+        << "    for (int64_t e = 0; e < E; e++)\n"
+        << "      if (live(e)) { lg[(size_t)e] = expf(lg[(size_t)e] - mx); sum += lg[(size_t)e]; }\n"
+        << "    int64_t best = -1;\n"
+        << "    for (int64_t e = 0; e < E; e++)\n"
+        << "      if (live(e) && (best < 0 || lg[(size_t)e] > lg[(size_t)best])) best = e;\n"
+        << "    const float p = (sum > 0.f && best >= 0) ? lg[(size_t)best] / sum : 0.f;\n"
+        << "    for (int64_t a = 0; a < H; a++) {\n"
+        << "      float acc = 0.f;\n"
+        << "      for (int64_t k = 0; k < D; k++) acc += x[i*D+k] * We1[best*D*H + k*H + a];\n"
+        << "      h[(size_t)a] = 0.5f*acc*(1.f + erff(acc*0.7071067811865476f));\n"
+        << "    }\n"
         << "    for (int64_t j = 0; j < D; j++) {\n"
         << "      float a = 0.f;\n"
-        << "      for (int64_t k = 0; k < D; k++) a += x[i*D+k] * We[best*D*D + k*D + j];\n"
+        << "      for (int64_t b = 0; b < H; b++) a += h[(size_t)b] * We2[best*H*D + b*D + j];\n"
         << "      out[i*D+j] = p * a;\n"
         << "    }\n"
         << "  }\n"
@@ -1971,16 +2236,20 @@ std::string CodeGenerator::gen_cpu(const MLIRModule& module, const CodegenOption
             case MLIROp::LAYER_MOE: {
                 string x = instr.operands.size() > 0 ? instr.operands[0] : "";
                 string Wg = instr.operands.size() > 1 ? instr.operands[1] : "";
-                string We = instr.operands.size() > 2 ? instr.operands[2] : "";
+                string We1 = instr.operands.size() > 2 ? instr.operands[2] : "";
+                string We2 = instr.operands.size() > 3 ? instr.operands[3] : "";
                 int64_t D = instr.int_attr > 0 ? instr.int_attr : (ids[x].cols > 0 ? ids[x].cols : 1);
                 int E = instr.attribute.empty() ? 4 : std::stoi(instr.attribute);
+                int H = instr.float_attr > 0 ? (int)instr.float_attr : 4 * D;
                 body += "  { int64_t M = (int64_t)(" + numel_expr(x) + ") / " + to_string(D) + ";\n";
                 body += "    buf_" + id + ".resize((size_t)(M * " + to_string(D) + "));\n";
                 body += "    ns_moe_fwd(" +
                         (ids[x].is_input ? string("input") : ("buf_" + x + ".data()")) + ", " +
                         (ids[Wg].is_input ? string("input") : ("buf_" + Wg + ".data()")) + ", " +
-                        (ids[We].is_input ? string("input") : ("buf_" + We + ".data()")) + ", buf_" +
-                        id + ".data(), M, " + to_string(D) + ", " + to_string(E) + "); }\n";
+                        (ids[We1].is_input ? string("input") : ("buf_" + We1 + ".data()")) + ", " +
+                        (ids[We2].is_input ? string("input") : ("buf_" + We2 + ".data()")) + ", " +
+                        (have_moe ? string("moe_active") : string("0")) + ", buf_" +
+                        id + ".data(), M, " + to_string(D) + ", " + to_string(H) + ", " + to_string(E) + "); }\n";
                 break;
             }
 
@@ -1991,7 +2260,8 @@ std::string CodeGenerator::gen_cpu(const MLIRModule& module, const CodegenOption
 
     // Host entry.
     oss << "extern \"C\" void " << opts.function_name << "(\n"
-        << "    const float* input, const float* weights, float* output, size_t n) {\n";
+        << "    const float* input, const float* weights, float* output, size_t n"
+        << (have_moe ? ", const uint8_t* moe_active" : "") << ") {\n";
     size_t off = 0;
     for (auto& w : worder) {
         int64_t szn = ids[w].static_numel > 0 ? ids[w].static_numel : 1;
@@ -2059,6 +2329,43 @@ std::string CodeGenerator::gen_cpu(const MLIRModule& module, const CodegenOption
         const MLIRFunction* tfn_ = nullptr;
         for (auto& f : module.functions) { if (f.is_train) { tfn_ = &f; break; } }
 
+        // MoE lifecycle metadata for the CPU context, checkpoint and the
+        // expert birth/merge/kill ABI (one MoE layer per model). Computed from
+        // the train-function LAYER_MOE instruction's attrs + the weight layout.
+        int moe_E = 0, moe_D = 0, moe_H = 0, moe_K0 = 0;
+        size_t moe_off_g = 0, moe_off_e1 = 0, moe_off_e2 = 0;
+
+        // MoE lifecycle metadata for the CPU context, checkpoint and the
+        // expert birth/merge/kill ABI (one MoE layer per model), read from the
+        // train or the inference function (whichever mentions the MoE layer).
+        {
+            const MLIRFunction* probes[2] = { tfn_, fn };
+            for (const MLIRFunction* pf : probes) {
+                if (!pf) continue;
+                for (auto& ins : pf->instructions) {
+                    if (ins.op != MLIROp::LAYER_MOE || ins.operands.size() < 4) continue;
+                    moe_E = ins.attribute.empty() ? 4 : std::atoi(ins.attribute.c_str());
+                    moe_D = (int)ins.int_attr;
+                    moe_H = (int)(ins.float_attr > 0 ? ins.float_attr
+                                                      : 4 * (double)ins.int_attr);
+                    moe_K0 = !ins.ints_attr.empty() ? (int)ins.ints_attr[0] : moe_E;
+                    if (moe_K0 <= 0 || moe_K0 > moe_E) moe_K0 = moe_E;
+                    break;
+                }
+                if (moe_E > 0) break;
+            }
+            if (moe_E > 0) {
+                size_t off = 0;
+                for (auto& w : worder) {
+                    int64_t szn = ids[w].static_numel > 0 ? ids[w].static_numel : 1;
+                    if (w.size() > 4 && w.compare(w.size() - 4, 4, "_g_w") == 0) moe_off_g = off;
+                    else if (w.size() > 5 && w.compare(w.size() - 5, 5, "_e1_w") == 0) moe_off_e1 = off;
+                    else if (w.size() > 5 && w.compare(w.size() - 5, 5, "_e2_w") == 0) moe_off_e2 = off;
+                    off += (size_t)szn;
+                }
+            }
+        }
+
         {
             struct IX { bool is_weight = false; };
             map<string, IX> sc;
@@ -2104,12 +2411,26 @@ std::string CodeGenerator::gen_cpu(const MLIRModule& module, const CodegenOption
                         }
                     }
                 }
+                if (moe_E > 0)
+                    oss << "  std::vector<uint8_t> moe_active; // MoE expert liveness (1 = alive)\n"
+                        << "  size_t moe_active_count = 0;     // number of alive experts\n";
                 oss << "  std::mt19937 rng;\n"
                     << "  int64_t lr_step = 0;   // LR schedule step counter (runtime wrapper)\n"
-                    << "  ns_cpu_ctx() : rng(0x9E3779B9u) {}\n"
+                    << "  ns_cpu_ctx() : rng(0x9E3779B9u) {"
+                    << (moe_E > 0 ? (" moe_active.assign(" + to_string(moe_E) + ", 0); for (int e = 0; e < " +
+                                     to_string(moe_K0) + "; e++) moe_active[(size_t)e] = 1; moe_active_count = (size_t)" +
+                                     to_string(moe_K0) + ";")
+                                  : string(""))
+                    << " }\n"
                     << "} ns_cpu_ctx;\n";
             } else {
-                oss << "typedef struct ns_cpu_ctx { std::mt19937 rng; ns_cpu_ctx() : rng(0x9E3779B9u) {} } ns_cpu_ctx;\n";
+                if (moe_E > 0)
+                    oss << "typedef struct ns_cpu_ctx { std::mt19937 rng; std::vector<uint8_t> moe_active; size_t moe_active_count = 0;"
+                        << " ns_cpu_ctx() : rng(0x9E3779B9u) { moe_active.assign(" << moe_E << ", 0);"
+                        << " for (int e = 0; e < " << moe_K0 << "; e++) moe_active[(size_t)e] = 1;"
+                        << " moe_active_count = (size_t)" << moe_K0 << "; } } ns_cpu_ctx;\n";
+                else
+                    oss << "typedef struct ns_cpu_ctx { std::mt19937 rng; ns_cpu_ctx() : rng(0x9E3779B9u) {} } ns_cpu_ctx;\n";
             }
         }
         oss << "typedef struct ns_model { float* w; size_t n; ns_cpu_ctx* ctx; } ns_model;\n"
@@ -2134,6 +2455,11 @@ std::string CodeGenerator::gen_cpu(const MLIRModule& module, const CodegenOption
             << ", ns_desc };\n";
         oss << "static const size_t ns_weight_total = " << total << ";\n";
         oss << "static const int64_t ns_in_cols = " << in_cols << ", ns_out_cols = " << out_cols << ";\n";
+        if (moe_E > 0)
+            oss << "static const size_t ns_moe_cap = " << moe_E << ", ns_moe_dim = " << moe_D
+                << ", ns_moe_ffn = " << moe_H << ", ns_moe_k0 = " << moe_K0
+                << ", ns_moe_off_g = " << moe_off_g << ", ns_moe_off_e1 = " << moe_off_e1
+                << ", ns_moe_off_e2 = " << moe_off_e2 << ";\n";
         oss << "}\n\n";
 
         oss << "extern \"C\" ns_model* ns_runtime_init(const float* weights, size_t num_floats) {\n";
@@ -2146,7 +2472,8 @@ std::string CodeGenerator::gen_cpu(const MLIRModule& module, const CodegenOption
         oss << "}\n\n";
         oss << "extern \"C\" int ns_eval_infer(ns_model* m, const float* input, float* output, size_t input_numel) {\n";
         oss << "    if (!m || !m->w) return -1;\n";
-        oss << "    " << opts.function_name << "(input, m->w, output, input_numel);\n";
+        oss << "    " << opts.function_name << "(input, m->w, output, input_numel"
+            << (moe_E > 0 ? ", m->ctx->moe_active.data()" : "") << ");\n";
         oss << "    return 0;\n";
         oss << "}\n\n";
         oss << "extern \"C\" size_t ns_model_output_numel(const ns_model* m, size_t input_numel) {\n";
@@ -2169,33 +2496,132 @@ std::string CodeGenerator::gen_cpu(const MLIRModule& module, const CodegenOption
         oss << "extern \"C\" void ns_free(ns_model* m) {\n";
         oss << "    if (!m) return; delete m->ctx; delete[] m->w; delete m;\n";
         oss << "}\n\n";
-        oss << "// Persist / restore the weight blob. Format: 4-byte magic \"NSM1\",\n";
-        oss << "// size_t float count, then the raw weights (host-endian).\n";
-        oss << "extern \"C\" int ns_save_checkpoint(const ns_model* m, const char* path) {\n";
-        oss << "    if (!m || !m->w || !path) return -1;\n";
-        oss << "    FILE* fp = fopen(path, \"wb\");\n";
-        oss << "    if (!fp) return -1;\n";
-        oss << "    const unsigned magic = 0x4E534D31u; /* \"NSM1\" */\n";
-        oss << "    if (fwrite(&magic, sizeof(magic), 1, fp) != 1 ||\n";
-        oss << "        fwrite(&ns_weight_total, sizeof(ns_weight_total), 1, fp) != 1 ||\n";
-        oss << "        fwrite(m->w, sizeof(float), ns_weight_total, fp) != ns_weight_total) {\n";
-        oss << "        fclose(fp); return -1;\n";
-        oss << "    }\n";
-        oss << "    fclose(fp); return 0;\n";
-        oss << "}\n\n";
-        oss << "extern \"C\" int ns_load_checkpoint(ns_model* m, const char* path) {\n";
-        oss << "    if (!m || !m->w || !path) return -1;\n";
-        oss << "    FILE* fp = fopen(path, \"rb\");\n";
-        oss << "    if (!fp) return -1;\n";
-        oss << "    unsigned magic = 0; size_t n = 0;\n";
-        oss << "    if (fread(&magic, sizeof(magic), 1, fp) != 1 ||\n";
-        oss << "        fread(&n, sizeof(n), 1, fp) != 1 ||\n";
-        oss << "        magic != 0x4E534D31u || n != ns_weight_total ||\n";
-        oss << "        fread(m->w, sizeof(float), n, fp) != n) {\n";
-        oss << "        fclose(fp); return -1;\n";
-        oss << "    }\n";
-        oss << "    fclose(fp); return 0;\n";
-        oss << "}\n";
+        oss << "// Persist / restore the weight blob + the MoE liveness mask. Format:\n"
+        << "// 4-byte magic \"NSM2\", size_t float count, raw weights, then (MoE\n"
+        << "// models) uint32 n_layers, uint32 capacity, <capacity> mask bytes.\n"
+        << "// Legacy \"NSM1\" files (weights only) load with all experts alive.\n"
+        << "extern \"C\" int ns_save_checkpoint(const ns_model* m, const char* path) {\n";
+        if (moe_E > 0)
+            oss << "    if (!m || !m->ctx || !m->w || !path) return -1;\n";
+        else
+            oss << "    if (!m || !m->w || !path) return -1;\n";
+        oss << "    FILE* fp = fopen(path, \"wb\");\n"
+            << "    if (!fp) return -1;\n"
+            << "    const unsigned magic = 0x4E534D32u; /* \"NSM2\" */\n"
+            << "    if (fwrite(&magic, sizeof(magic), 1, fp) != 1 ||\n"
+            << "        fwrite(&ns_weight_total, sizeof(ns_weight_total), 1, fp) != 1 ||\n"
+            << "        fwrite(m->w, sizeof(float), ns_weight_total, fp) != ns_weight_total) {\n"
+            << "        fclose(fp); return -1;\n"
+            << "    }\n";
+        if (moe_E > 0)
+            oss << "    { const unsigned n_layers = 1U;\n"
+                << "      if (fwrite(&n_layers, sizeof(n_layers), 1, fp) != 1 ||\n"
+                << "          fwrite(&ns_moe_cap, sizeof(ns_moe_cap), 1, fp) != 1 ||\n"
+                << "          fwrite(m->ctx->moe_active.data(), 1, ns_moe_cap, fp) != ns_moe_cap) {\n"
+                << "          fclose(fp); return -1;\n"
+                << "      } }\n";
+        oss << "    fclose(fp); return 0;\n"
+            << "}\n\n"
+            << "extern \"C\" int ns_load_checkpoint(ns_model* m, const char* path) {\n";
+        if (moe_E > 0)
+            oss << "    if (!m || !m->ctx || !m->w || !path) return -1;\n";
+        else
+            oss << "    if (!m || !m->w || !path) return -1;\n";
+        oss << "    FILE* fp = fopen(path, \"rb\");\n"
+            << "    if (!fp) return -1;\n"
+            << "    unsigned magic = 0; size_t n = 0;\n"
+            << "    if (fread(&magic, sizeof(magic), 1, fp) != 1 ||\n"
+            << "        fread(&n, sizeof(n), 1, fp) != 1 ||\n"
+            << "        (magic != 0x4E534D31u && magic != 0x4E534D32u) || n != ns_weight_total ||\n"
+            << "        fread(m->w, sizeof(float), n, fp) != n) {\n"
+            << "        fclose(fp); return -1;\n"
+            << "    }\n";
+        if (moe_E > 0)
+            oss << "    if (magic == 0x4E534D32u) {\n"
+                << "      unsigned n_layers = 0; size_t cap = 0;\n"
+                << "      if (fread(&n_layers, sizeof(n_layers), 1, fp) != 1 ||\n"
+                << "          fread(&cap, sizeof(cap), 1, fp) != 1 ||\n"
+                << "          n_layers != 1U || cap != ns_moe_cap ||\n"
+                << "          fread(m->ctx->moe_active.data(), 1, cap, fp) != cap) {\n"
+                << "          fclose(fp); return -1;\n"
+                << "      }\n"
+                << "    } else { /* NSM1 fallback: every capacity slot is alive */\n"
+                << "      m->ctx->moe_active.assign(ns_moe_cap, 1);\n"
+                << "    }\n"
+                << "    m->ctx->moe_active_count = 0;\n"
+                << "    for (size_t e = 0; e < ns_moe_cap; e++)\n"
+                << "      m->ctx->moe_active_count += m->ctx->moe_active[e];\n";
+        oss << "    fclose(fp); return 0;\n"
+            << "}\n\n";
+        if (moe_E > 0) {
+            oss << "// ---- MoE expert lifecycle (capacity is compile-time; liveness\n"
+                << "//      is runtime state in the context) ----\n"
+                << "extern \"C\" size_t ns_expert_count(const ns_model* m) {\n"
+                << "    if (!m || !m->ctx) return 0;\n"
+                << "    return m->ctx->moe_active_count;\n"
+                << "}\n\n"
+                << "extern \"C\" size_t ns_expert_birth(ns_model* m, int n) {\n"
+                << "    if (!m || !m->ctx || !m->w || n <= 0) return m && m->ctx ? m->ctx->moe_active_count : 0;\n"
+                << "    if (m->ctx->moe_active_count >= ns_moe_cap) return m->ctx->moe_active_count;\n"
+                << "    // Source: a random live expert (weights copied + perturbed).\n"
+                << "    int src = (int)(m->ctx->rng() % ns_moe_cap);\n"
+                << "    size_t tries = 0;\n"
+                << "    while (tries++ < ns_moe_cap && !m->ctx->moe_active[(size_t)src])\n"
+                << "      src = (int)(m->ctx->rng() % ns_moe_cap);\n"
+                << "    const size_t s1 = (size_t)src * ns_moe_dim * ns_moe_ffn;\n"
+                << "    const size_t s2 = (size_t)src * ns_moe_ffn * ns_moe_dim;\n"
+                << "    for (int e = 0; e < (int)ns_moe_cap && n > 0; e++) {\n"
+                << "      if (m->ctx->moe_active[(size_t)e]) continue;\n"
+                << "      const size_t g1 = (size_t)e * ns_moe_dim, g2 = (size_t)e * ns_moe_dim * ns_moe_ffn;\n"
+                << "      const size_t g3 = (size_t)e * ns_moe_ffn * ns_moe_dim;\n"
+                << "      for (size_t k = 0; k < ns_moe_dim; k++)\n"
+                << "        m->w[ns_moe_off_g + k * ns_moe_cap + (size_t)e] =\n"
+                << "          m->w[ns_moe_off_g + k * ns_moe_cap + (size_t)src] +\n"
+                << "          ((float)(m->ctx->rng() % 1001) / 1000.f - 0.5f) * 1e-2f;\n"
+                << "      for (size_t q = 0; q < ns_moe_dim * ns_moe_ffn; q++)\n"
+                << "        m->w[ns_moe_off_e1 + g2 + q] = m->w[ns_moe_off_e1 + s1 + q] +\n"
+                << "          ((float)(m->ctx->rng() % 1001) / 1000.f - 0.5f) * 1e-2f;\n"
+                << "      for (size_t q = 0; q < ns_moe_ffn * ns_moe_dim; q++)\n"
+                << "        m->w[ns_moe_off_e2 + g3 + q] = m->w[ns_moe_off_e2 + s2 + q] +\n"
+                << "          ((float)(m->ctx->rng() % 1001) / 1000.f - 0.5f) * 1e-2f;\n"
+                << "      m->ctx->moe_active[(size_t)e] = 1;\n"
+                << "      m->ctx->moe_active_count++;\n"
+                << "      n--;\n"
+                << "    }\n"
+                << "    return m->ctx->moe_active_count;\n"
+                << "}\n\n"
+                << "extern \"C\" size_t ns_expert_merge(ns_model* m, int a, int b) {\n"
+                << "    if (!m || !m->ctx || !m->w || a < 0 || b < 0 || a == b ||\n"
+                << "        a >= (int)ns_moe_cap || b >= (int)ns_moe_cap ||\n"
+                << "        !m->ctx->moe_active[(size_t)a] || !m->ctx->moe_active[(size_t)b])\n"
+                << "        return m && m->ctx ? m->ctx->moe_active_count : 0;\n"
+                << "    const size_t s1 = (size_t)a * ns_moe_dim * ns_moe_ffn;\n"
+                << "    const size_t s1b = (size_t)b * ns_moe_dim * ns_moe_ffn;\n"
+                << "    const size_t t2 = (size_t)a * ns_moe_ffn * ns_moe_dim;\n"
+                << "    const size_t t2b = (size_t)b * ns_moe_ffn * ns_moe_dim;\n"
+                << "    for (size_t k = 0; k < ns_moe_dim; k++)\n"
+                << "      m->w[ns_moe_off_g + k * ns_moe_cap + (size_t)a] =\n"
+                << "        0.5f * (m->w[ns_moe_off_g + k * ns_moe_cap + (size_t)a] +\n"
+                << "                m->w[ns_moe_off_g + k * ns_moe_cap + (size_t)b]);\n"
+                << "    for (size_t q = 0; q < ns_moe_dim * ns_moe_ffn; q++)\n"
+                << "      m->w[ns_moe_off_e1 + s1 + q] =\n"
+                << "        0.5f * (m->w[ns_moe_off_e1 + s1 + q] + m->w[ns_moe_off_e1 + s1b + q]);\n"
+                << "    for (size_t q = 0; q < ns_moe_ffn * ns_moe_dim; q++)\n"
+                << "      m->w[ns_moe_off_e2 + t2 + q] =\n"
+                << "        0.5f * (m->w[ns_moe_off_e2 + t2 + q] + m->w[ns_moe_off_e2 + t2b + q]);\n"
+                << "    m->ctx->moe_active[(size_t)b] = 0;\n"
+                << "    m->ctx->moe_active_count--;\n"
+                << "    return m->ctx->moe_active_count;\n"
+                << "}\n\n"
+                << "extern \"C\" size_t ns_expert_kill(ns_model* m, int k) {\n"
+                << "    if (!m || !m->ctx || k < 0 || k >= (int)ns_moe_cap ||\n"
+                << "        !m->ctx->moe_active[(size_t)k])\n"
+                << "        return m && m->ctx ? m->ctx->moe_active_count : 0;\n"
+                << "    m->ctx->moe_active[(size_t)k] = 0;\n"
+                << "    m->ctx->moe_active_count--;\n"
+                << "    return m->ctx->moe_active_count;\n"
+                << "}\n\n";
+        }
 
         // ---- AOT training (network train() method present) ----
         for (auto& f : module.functions) {
@@ -2400,12 +2826,15 @@ std::string CodeGenerator::emit_train_core(const MLIRFunction& tfn, int64_t in_c
                 string x = instr.operands.size() > 0 ? instr.operands[0] : "";
                 string Wg = instr.operands.size() > 1 ? instr.operands[1] : "";
                 string We = instr.operands.size() > 2 ? instr.operands[2] : "";
+                string We2 = instr.operands.size() > 3 ? instr.operands[3] : "";
                 int64_t D = instr.int_attr > 0 ? instr.int_attr : 1;
                 int64_t E = instr.attribute.empty() ? 4 : std::atol(instr.attribute.c_str());
+                int64_t H = instr.float_attr > 0 ? (int64_t)instr.float_attr : 4 * D;
                 fwd_body += "  { int64_t M = (int64_t)(" + numel_of(x) + ") / " + to_string(D) + ";\n";
                 fwd_body += "    buf_" + id + ".resize((size_t)(M * " + to_string(D) + "));\n";
                 fwd_body += "    ns_moe_fwd(" + src_of(x) + ", " + src_of(Wg) + ", " + src_of(We) +
-                            ", buf_" + id + ".data(), M, " + to_string(D) + ", " + to_string(E) + "); }\n";
+                            ", " + src_of(We2) + ", ctx->moe_active.data(), buf_" +
+                            id + ".data(), M, " + to_string(D) + ", " + to_string(H) + ", " + to_string(E) + "); }\n";
                 break;
             }
             case MLIROp::LAYER_ATTENTION: {
@@ -2522,40 +2951,65 @@ std::string CodeGenerator::emit_train_core(const MLIRFunction& tfn, int64_t in_c
                 string dout = instr.operands.size() > 0 ? instr.operands[0] : "";
                 string xo = instr.operands.size() > 1 ? instr.operands[1] : "";
                 string Wg = instr.operands.size() > 2 ? instr.operands[2] : "";
-                string We = instr.operands.size() > 3 ? instr.operands[3] : "";
+                string We1 = instr.operands.size() > 3 ? instr.operands[3] : "";
+                string We2 = instr.operands.size() > 4 ? instr.operands[4] : "";
                 int64_t D = instr.int_attr > 0 ? instr.int_attr : 1;
                 int64_t E = instr.attribute.empty() ? 4 : std::atol(instr.attribute.c_str());
+                int64_t H = instr.float_attr > 0 ? (int64_t)instr.float_attr : 4 * D;
                 train_body += "  { int64_t M = (int64_t)(buf_" + dout + ".size()) / " + to_string(D) + ";\n";
                 train_body += "    buf_" + id + ".resize((size_t)(M * " + to_string(D) + "));\n";
                 train_body += "    for (size_t q = 0; q < buf_" + id + ".size(); q++) buf_" + id + "[q] = 0.f;\n";
                 train_body += "    ns_moe_grad_x(buf_" + dout + ".data(), " + src_of(xo) + ", " + src_of(Wg) +
-                              ", " + src_of(We) + ", buf_" + id + ".data(), M, " + to_string(D) + ", " + to_string(E) + "); }\n";
+                              ", " + src_of(We1) + ", " + src_of(We2) +
+                              ", ctx->moe_active.data(), buf_" + id + ".data(), M, " + to_string(D) + ", " + to_string(H) + ", " + to_string(E) + "); }\n";
                 break;
             }
             case MLIROp::MOE_GRAD_WG: {
                 string dout = instr.operands.size() > 0 ? instr.operands[0] : "";
                 string xo = instr.operands.size() > 1 ? instr.operands[1] : "";
                 string Wg = instr.operands.size() > 2 ? instr.operands[2] : "";
-                string We = instr.operands.size() > 3 ? instr.operands[3] : "";
+                string We1 = instr.operands.size() > 3 ? instr.operands[3] : "";
+                string We2 = instr.operands.size() > 4 ? instr.operands[4] : "";
                 int64_t D = instr.int_attr > 0 ? instr.int_attr : 1;
                 int64_t E = instr.attribute.empty() ? 4 : std::atol(instr.attribute.c_str());
+                int64_t H = instr.float_attr > 0 ? (int64_t)instr.float_attr : 4 * D;
                 train_body += "  { int64_t M = (int64_t)(buf_" + dout + ".size()) / " + to_string(D) + ";\n";
                 train_body += "    buf_" + id + ".resize((size_t)(" + to_string(D) + " * " + to_string(E) + "));\n";
                 train_body += "    ns_moe_grad_wg(buf_" + dout + ".data(), " + src_of(xo) + ", " + src_of(Wg) +
-                              ", " + src_of(We) + ", buf_" + id + ".data(), M, " + to_string(D) + ", " + to_string(E) + "); }\n";
+                              ", " + src_of(We1) + ", " + src_of(We2) +
+                              ", ctx->moe_active.data(), buf_" + id + ".data(), M, " + to_string(D) + ", " + to_string(H) + ", " + to_string(E) + "); }\n";
                 break;
             }
-            case MLIROp::MOE_GRAD_WE: {
+            case MLIROp::MOE_GRAD_WE1: {
                 string dout = instr.operands.size() > 0 ? instr.operands[0] : "";
                 string xo = instr.operands.size() > 1 ? instr.operands[1] : "";
                 string Wg = instr.operands.size() > 2 ? instr.operands[2] : "";
-                string We = instr.operands.size() > 3 ? instr.operands[3] : "";
+                string We1 = instr.operands.size() > 3 ? instr.operands[3] : "";
+                string We2 = instr.operands.size() > 4 ? instr.operands[4] : "";
                 int64_t D = instr.int_attr > 0 ? instr.int_attr : 1;
                 int64_t E = instr.attribute.empty() ? 4 : std::atol(instr.attribute.c_str());
+                int64_t H = instr.float_attr > 0 ? (int64_t)instr.float_attr : 4 * D;
                 train_body += "  { int64_t M = (int64_t)(buf_" + dout + ".size()) / " + to_string(D) + ";\n";
-                train_body += "    buf_" + id + ".resize((size_t)(" + to_string(E) + " * " + to_string(D) + " * " + to_string(D) + "));\n";
-                train_body += "    ns_moe_grad_we(buf_" + dout + ".data(), " + src_of(xo) + ", " + src_of(Wg) +
-                              ", " + src_of(We) + ", buf_" + id + ".data(), M, " + to_string(D) + ", " + to_string(E) + "); }\n";
+                train_body += "    buf_" + id + ".resize((size_t)(" + to_string(E) + " * " + to_string(D) + " * " + to_string(H) + "));\n";
+                train_body += "    ns_moe_grad_we1(buf_" + dout + ".data(), " + src_of(xo) + ", " + src_of(Wg) +
+                              ", " + src_of(We1) + ", " + src_of(We2) +
+                              ", ctx->moe_active.data(), buf_" + id + ".data(), M, " + to_string(D) + ", " + to_string(H) + ", " + to_string(E) + "); }\n";
+                break;
+            }
+            case MLIROp::MOE_GRAD_WE2: {
+                string dout = instr.operands.size() > 0 ? instr.operands[0] : "";
+                string xo = instr.operands.size() > 1 ? instr.operands[1] : "";
+                string Wg = instr.operands.size() > 2 ? instr.operands[2] : "";
+                string We1 = instr.operands.size() > 3 ? instr.operands[3] : "";
+                string We2 = instr.operands.size() > 4 ? instr.operands[4] : "";
+                int64_t D = instr.int_attr > 0 ? instr.int_attr : 1;
+                int64_t E = instr.attribute.empty() ? 4 : std::atol(instr.attribute.c_str());
+                int64_t H = instr.float_attr > 0 ? (int64_t)instr.float_attr : 4 * D;
+                train_body += "  { int64_t M = (int64_t)(buf_" + dout + ".size()) / " + to_string(D) + ";\n";
+                train_body += "    buf_" + id + ".resize((size_t)(" + to_string(E) + " * " + to_string(H) + " * " + to_string(D) + "));\n";
+                train_body += "    ns_moe_grad_we2(buf_" + dout + ".data(), " + src_of(xo) + ", " + src_of(Wg) +
+                              ", " + src_of(We1) + ", " + src_of(We2) +
+                              ", ctx->moe_active.data(), buf_" + id + ".data(), M, " + to_string(D) + ", " + to_string(H) + ", " + to_string(E) + "); }\n";
                 break;
             }
             case MLIROp::ATTENTION_GRAD_X:
@@ -2850,14 +3304,18 @@ std::string CodeGenerator::emit_train_core_cuda(const MLIRFunction& tfn,
             case MLIROp::LAYER_MOE: {
                 string x = instr.operands.size() > 0 ? instr.operands[0] : "";
                 string Wg = instr.operands.size() > 1 ? instr.operands[1] : "";
-                string We = instr.operands.size() > 2 ? instr.operands[2] : "";
+                string We1 = instr.operands.size() > 2 ? instr.operands[2] : "";
+                string We2 = instr.operands.size() > 3 ? instr.operands[3] : "";
                 int64_t D = instr.int_attr > 0 ? instr.int_attr : 1;
                 int64_t E = instr.attribute.empty() ? 4 : std::atol(instr.attribute.c_str());
+                int64_t H = instr.float_attr > 0 ? (int64_t)instr.float_attr : 4 * D;
+                fwd_text += "  ns_moe_mask_sync(ctx);\n";
                 fwd_text += "  if (ns_cu_reserve(&ctx->d_" + id + ", &ctx->d_" + id + "_cap, (size_t)(M * "
                     + to_string(D) + ") * sizeof(float), 0)) return;\n";
                 fwd_text += "  NS_LAUNCH_BLOCKS(ns_moe_kernel, M, "
-                    + bufv(x) + ", " + bufv(Wg) + ", " + bufv(We) + ", ctx->d_" + id + ", "
-                    + "M, " + to_string(D) + ", " + to_string(E) + ");\n";
+                    + bufv(x) + ", " + bufv(Wg) + ", " + bufv(We1) + ", " + bufv(We2)
+                    + ", ctx->d_moe_a, ctx->d_" + id + ", "
+                    + "M, " + to_string(D) + ", " + to_string(H) + ", " + to_string(E) + ");\n";
                 break;
             }
             case MLIROp::LAYER_ATTENTION: {
@@ -2998,46 +3456,74 @@ std::string CodeGenerator::emit_train_core_cuda(const MLIRFunction& tfn,
                 string dout = instr.operands.size() > 0 ? instr.operands[0] : "";
                 string xo = instr.operands.size() > 1 ? instr.operands[1] : "";
                 string Wg = instr.operands.size() > 2 ? instr.operands[2] : "";
-                string We = instr.operands.size() > 3 ? instr.operands[3] : "";
+                string We1 = instr.operands.size() > 3 ? instr.operands[3] : "";
+                string We2 = instr.operands.size() > 4 ? instr.operands[4] : "";
                 int64_t D = instr.int_attr > 0 ? instr.int_attr : 1;
                 int64_t E = instr.attribute.empty() ? 4 : std::atol(instr.attribute.c_str());
+                int64_t H = instr.float_attr > 0 ? (int64_t)instr.float_attr : 4 * D;
                 train_text += "  if (ns_cu_reserve(&ctx->d_" + id + ", &ctx->d_" + id + "_cap, (size_t)M * "
                     + to_string(D) + " * sizeof(float), 0)) return;\n";
+                train_text += "  if (ns_cu_reserve_u8(&ctx->d_moe_a, &ctx->d_moe_a_cap, ctx->moe_cap, 0)) return;\n";
                 train_text += "  NS_LAUNCH_BLOCKS(ns_moe_grad_x_kernel, M, "
-                    + bufv(dout) + ", " + bufv(xo) + ", " + bufv(Wg) + ", " + bufv(We)
-                    + ", ctx->d_" + id + ", M, " + to_string(D) + ", " + to_string(E) + ");\n";
+                    + bufv(dout) + ", " + bufv(xo) + ", " + bufv(Wg) + ", " + bufv(We1) + ", " + bufv(We2)
+                    + ", ctx->d_moe_a, ctx->d_" + id + ", M, " + to_string(D) + ", " + to_string(H) + ", " + to_string(E) + ");\n";
                 break;
             }
             case MLIROp::MOE_GRAD_WG: {
                 string dout = instr.operands.size() > 0 ? instr.operands[0] : "";
                 string xo = instr.operands.size() > 1 ? instr.operands[1] : "";
                 string Wg = instr.operands.size() > 2 ? instr.operands[2] : "";
-                string We = instr.operands.size() > 3 ? instr.operands[3] : "";
+                string We1 = instr.operands.size() > 3 ? instr.operands[3] : "";
+                string We2 = instr.operands.size() > 4 ? instr.operands[4] : "";
                 int64_t D = instr.int_attr > 0 ? instr.int_attr : 1;
                 int64_t E = instr.attribute.empty() ? 4 : std::atol(instr.attribute.c_str());
+                int64_t H = instr.float_attr > 0 ? (int64_t)instr.float_attr : 4 * D;
                 string nwg = to_string(D) + " * " + to_string(E);
                 train_text += "  if (ns_cu_reserve(&ctx->d_" + id + ", &ctx->d_" + id + "_cap, (size_t)("
                     + nwg + ") * sizeof(float), 0)) return;\n";
                 train_text += "  NS_LAUNCH1(ns_fill_kernel, " + nwg + ", ctx->d_" + id + ", " + nwg + ", 0.0f);\n";
+                train_text += "  if (ns_cu_reserve_u8(&ctx->d_moe_a, &ctx->d_moe_a_cap, ctx->moe_cap, 0)) return;\n";
                 train_text += "  NS_LAUNCH_BLOCKS(ns_moe_grad_wg_kernel, M, "
-                    + bufv(dout) + ", " + bufv(xo) + ", " + bufv(Wg) + ", " + bufv(We)
-                    + ", ctx->d_" + id + ", M, " + to_string(D) + ", " + to_string(E) + ");\n";
+                    + bufv(dout) + ", " + bufv(xo) + ", " + bufv(Wg) + ", " + bufv(We1) + ", " + bufv(We2)
+                    + ", ctx->d_moe_a, ctx->d_" + id + ", M, " + to_string(D) + ", " + to_string(H) + ", " + to_string(E) + ");\n";
                 break;
             }
-            case MLIROp::MOE_GRAD_WE: {
+            case MLIROp::MOE_GRAD_WE1: {
                 string dout = instr.operands.size() > 0 ? instr.operands[0] : "";
                 string xo = instr.operands.size() > 1 ? instr.operands[1] : "";
                 string Wg = instr.operands.size() > 2 ? instr.operands[2] : "";
-                string We = instr.operands.size() > 3 ? instr.operands[3] : "";
+                string We1 = instr.operands.size() > 3 ? instr.operands[3] : "";
+                string We2 = instr.operands.size() > 4 ? instr.operands[4] : "";
                 int64_t D = instr.int_attr > 0 ? instr.int_attr : 1;
                 int64_t E = instr.attribute.empty() ? 4 : std::atol(instr.attribute.c_str());
-                string nwe = to_string(E) + " * " + to_string(D) + " * " + to_string(D);
+                int64_t H = instr.float_attr > 0 ? (int64_t)instr.float_attr : 4 * D;
+                string nwe = to_string(E) + " * " + to_string(D) + " * " + to_string(H);
                 train_text += "  if (ns_cu_reserve(&ctx->d_" + id + ", &ctx->d_" + id + "_cap, (size_t)("
                     + nwe + ") * sizeof(float), 0)) return;\n";
                 train_text += "  NS_LAUNCH1(ns_fill_kernel, " + nwe + ", ctx->d_" + id + ", " + nwe + ", 0.0f);\n";
-                train_text += "  NS_LAUNCH_BLOCKS(ns_moe_grad_we_kernel, M, "
-                    + bufv(dout) + ", " + bufv(xo) + ", " + bufv(Wg) + ", " + bufv(We)
-                    + ", ctx->d_" + id + ", M, " + to_string(D) + ", " + to_string(E) + ");\n";
+                train_text += "  if (ns_cu_reserve_u8(&ctx->d_moe_a, &ctx->d_moe_a_cap, ctx->moe_cap, 0)) return;\n";
+                train_text += "  NS_LAUNCH_BLOCKS(ns_moe_grad_we1_kernel, M, "
+                    + bufv(dout) + ", " + bufv(xo) + ", " + bufv(Wg) + ", " + bufv(We1) + ", " + bufv(We2)
+                    + ", ctx->d_moe_a, ctx->d_" + id + ", M, " + to_string(D) + ", " + to_string(H) + ", " + to_string(E) + ");\n";
+                break;
+            }
+            case MLIROp::MOE_GRAD_WE2: {
+                string dout = instr.operands.size() > 0 ? instr.operands[0] : "";
+                string xo = instr.operands.size() > 1 ? instr.operands[1] : "";
+                string Wg = instr.operands.size() > 2 ? instr.operands[2] : "";
+                string We1 = instr.operands.size() > 3 ? instr.operands[3] : "";
+                string We2 = instr.operands.size() > 4 ? instr.operands[4] : "";
+                int64_t D = instr.int_attr > 0 ? instr.int_attr : 1;
+                int64_t E = instr.attribute.empty() ? 4 : std::atol(instr.attribute.c_str());
+                int64_t H = instr.float_attr > 0 ? (int64_t)instr.float_attr : 4 * D;
+                string nwe = to_string(E) + " * " + to_string(H) + " * " + to_string(D);
+                train_text += "  if (ns_cu_reserve(&ctx->d_" + id + ", &ctx->d_" + id + "_cap, (size_t)("
+                    + nwe + ") * sizeof(float), 0)) return;\n";
+                train_text += "  NS_LAUNCH1(ns_fill_kernel, " + nwe + ", ctx->d_" + id + ", " + nwe + ", 0.0f);\n";
+                train_text += "  if (ns_cu_reserve_u8(&ctx->d_moe_a, &ctx->d_moe_a_cap, ctx->moe_cap, 0)) return;\n";
+                train_text += "  NS_LAUNCH_BLOCKS(ns_moe_grad_we2_kernel, M, "
+                    + bufv(dout) + ", " + bufv(xo) + ", " + bufv(Wg) + ", " + bufv(We1) + ", " + bufv(We2)
+                    + ", ctx->d_moe_a, ctx->d_" + id + ", M, " + to_string(D) + ", " + to_string(H) + ", " + to_string(E) + ");\n";
                 break;
             }
             case MLIROp::ATTENTION_GRAD_X:

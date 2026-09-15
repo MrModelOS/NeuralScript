@@ -845,6 +845,14 @@ LayerRule ShapeChecker::parse_layer_rule(Stmt* layer) {
         } else if (p.name == "experts" || p.name == "num_experts") {
             if (!v.empty() && std::isdigit((unsigned char)v[0])) rule.num_experts = DimExpr::constant(std::stoll(v));
             else rule.num_experts = DimExpr::symbolic(v);
+        } else if (p.name == "ffn_dim" || p.name == "ffn" || p.name == "hidden" ||
+                   p.name == "d_ff" || p.name == "intermediate") {
+            if (!v.empty() && std::isdigit((unsigned char)v[0])) rule.ffn_dim = DimExpr::constant(std::stoll(v));
+            else rule.ffn_dim = DimExpr::symbolic(v);
+        } else if (p.name == "initial_experts" || p.name == "active" || p.name == "k" ||
+                   p.name == "initial_active") {
+            if (!v.empty() && std::isdigit((unsigned char)v[0])) rule.initial_experts = DimExpr::constant(std::stoll(v));
+            else rule.initial_experts = DimExpr::symbolic(v);
         }
     }
     return rule;
