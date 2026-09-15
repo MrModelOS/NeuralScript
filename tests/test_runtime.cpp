@@ -119,6 +119,35 @@ int main() {
         max_err = std::max(max_err, (double)std::fabs(out[i] - ref[i]));
     std::printf("%.3e\n", max_err);
 
+    // --- Checkpoint save/load round-trip ---
+    std::vector<float> w0(w.size());
+    if (ns_model_get_weights(m, w0.data(), w0.size()) != 0) { std::printf("GETW0_FAIL\n"); return 1; }
+    if (ns_save_checkpoint(m, "/tmp/ns_cp_a.bin") != 0) { std::printf("SAVE_A_FAIL\n"); return 1; }
+
+    std::vector<float> w2(w.size());
+    for (auto& v : w2) v = dist(rng);
+    ns_model* m2 = ns_runtime_init(w2.data(), w2.size());
+    if (!m2) { std::printf("INIT2_FAIL\n"); return 1; }
+    if (ns_save_checkpoint(m2, "/tmp/ns_cp_b.bin") != 0) { std::printf("SAVE_B_FAIL\n"); return 1; }
+    ns_free(m2);
+
+    if (ns_load_checkpoint(m, "/tmp/ns_cp_b.bin") != 0) { std::printf("LOAD_B_FAIL\n"); return 1; }
+    std::vector<float> wT(w.size());
+    if (ns_model_get_weights(m, wT.data(), wT.size()) != 0) { std::printf("GETW_B_FAIL\n"); return 1; }
+    for (size_t i = 0; i < w.size(); i++)
+        if (wT[i] != w2[i]) { std::printf("LOADBMISMATCH %zu\n", i); return 1; }
+
+    if (ns_load_checkpoint(m, "/tmp/ns_cp_a.bin") != 0) { std::printf("LOAD_A_FAIL\n"); return 1; }
+    if (ns_model_get_weights(m, wT.data(), wT.size()) != 0) { std::printf("GETW_A_FAIL\n"); return 1; }
+    for (size_t i = 0; i < w.size(); i++)
+        if (wT[i] != w0[i]) { std::printf("LOADAMISMATCH %zu\n", i); return 1; }
+
+    if (ns_load_checkpoint(m, "/tmp/ns_no_such_cp.bin") != -1) { std::printf("LOADMISSING_FAIL\n"); return 1; }
+    if (ns_save_checkpoint(nullptr, "/tmp/ns_cp_x.bin") != -1) { std::printf("SAVENULL_FAIL\n"); return 1; }
+    std::remove("/tmp/ns_cp_a.bin");
+    std::remove("/tmp/ns_cp_b.bin");
+    std::printf("checkpoints: ok\n");
+
     ns_free(m);
     return max_err < 1e-4 ? 0 : 1;
 }

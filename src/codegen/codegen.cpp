@@ -17,6 +17,27 @@ std::string fmt_float(float v) {
     return o.str();
 }
 
+// Emit the compiled-in LR schedule as a standalone helper for the runtime
+// driver. The body is a constant-fold of optim_params.hpp so the generated TU
+// stays self-contained (no library linkage).
+std::string lr_schedule_source() {
+    std::ostringstream o;
+    o << "static float ns_lr_schedule(int64_t step) {\n"
+      << "    if (" << (int)optim::kLRSchedule << " == 0) return 1.0f;\n"
+      << "    if (" << optim::kLrWarmupSteps << " <= 0) return 1.0f;\n"
+      << "    if (step < " << optim::kLrWarmupSteps
+      << ") return (float)step / (float)" << optim::kLrWarmupSteps << ";\n"
+      << "    const int64_t end = " << optim::kLrTotalSteps << " > " << optim::kLrWarmupSteps
+      << " ? " << optim::kLrTotalSteps << " : " << (optim::kLrWarmupSteps + 1) << ";\n"
+      << "    const int64_t s = step >= end ? end : step;\n"
+      << "    const float t = (float)(s - " << optim::kLrWarmupSteps
+      << ") / (float)(end - " << optim::kLrWarmupSteps << ");\n"
+      << "    return " << fmt_float(optim::kLrMinFactor) << " + 0.5f * (1.0f - "
+      << fmt_float(optim::kLrMinFactor) << ") * (1.0f + cosf(3.14159265f * t));\n"
+      << "}\n";
+    return o.str();
+}
+
 // Identify the runtime data input of an inference instruction. GEMMs consume
 // it as A; v1.2 layer ops consume it via their tensor operand (embedding: the
 // index vector, operand[1]).
@@ -446,6 +467,7 @@ std::string CodeGenerator::gen_cuda(const MLIRModule& module, const CodegenOptio
             }
         }
         oss << "  size_t adam_step = 0;    // AdamW bias-correction step counter\n"
+            << "  int64_t lr_step = 0;     // LR schedule step counter (runtime wrapper)\n"
             << "  unsigned drop_seed = 0;  // dropout RNG seed counter\n"
             << "  NSContext() {}\n"
             << "  ~NSContext() {\n"
@@ -901,16 +923,49 @@ std::string CodeGenerator::gen_cuda(const MLIRModule& module, const CodegenOptio
             << "}\n\n"
             << "extern \"C\" void ns_free(ns_model* m) {\n"
             << "    if (!m) return; delete m->ctx; delete[] m->h_w; delete m;\n"
+            << "}\n\n"
+            << "// Persist / restore the weight blob. Format: 4-byte magic \"NSM1\",\n"
+            << "// size_t float count, then the raw weights (host-endian).\n"
+            << "extern \"C\" int ns_save_checkpoint(const ns_model* m, const char* path) {\n"
+            << "    if (!m || !m->h_w || !path) return -1;\n"
+            << "    FILE* fp = fopen(path, \"wb\");\n"
+            << "    if (!fp) return -1;\n"
+            << "    const unsigned magic = 0x4E534D31u; /* \"NSM1\" */\n"
+            << "    if (fwrite(&magic, sizeof(magic), 1, fp) != 1 ||\n"
+            << "        fwrite(&ns_weight_total, sizeof(ns_weight_total), 1, fp) != 1 ||\n"
+            << "        fwrite(m->h_w, sizeof(float), ns_weight_total, fp) != ns_weight_total) {\n"
+            << "        fclose(fp); return -1;\n"
+            << "    }\n"
+            << "    fclose(fp); return 0;\n"
+            << "}\n\n"
+            << "extern \"C\" int ns_load_checkpoint(ns_model* m, const char* path) {\n"
+            << "    if (!m || !m->ctx || !m->h_w || !path) return -1;\n"
+            << "    FILE* fp = fopen(path, \"rb\");\n"
+            << "    if (!fp) return -1;\n"
+            << "    unsigned magic = 0; size_t n = 0;\n"
+            << "    if (fread(&magic, sizeof(magic), 1, fp) != 1 ||\n"
+            << "        fread(&n, sizeof(n), 1, fp) != 1 ||\n"
+            << "        magic != 0x4E534D31u || n != ns_weight_total ||\n"
+            << "        fread(m->h_w, sizeof(float), n, fp) != n) {\n"
+            << "        fclose(fp); return -1;\n"
+            << "    }\n"
+            << "    fclose(fp);\n"
+            << "    cudaMemcpy(m->ctx->d_wb, m->h_w, ns_weight_total * sizeof(float), cudaMemcpyHostToDevice);\n"
+            << "    return 0;\n"
             << "}\n";
 
         if (tfn) {
             oss << "\n// ---- CUDA training core (forward + backward + optimizer on device) ----\n"
                 << emit_train_core_cuda(*tfn, in_cols, out_cols)
+                << "\n" << lr_schedule_source()
                 << "\nextern \"C\" int ns_runtime_train_step(ns_model* m, const float* input,\n"
                 << "                                        const float* labels, size_t input_numel,\n"
                 << "                                        float* loss_out, float lr) {\n"
                 << "    if (!m || !m->ctx || !m->ctx->d_wb) return -1;\n"
-                << "    ns_train_core(m->ctx, input, input_numel, labels, m->h_w, m->h_w, loss_out, lr, 1);\n"
+                << "    int64_t st = m->ctx->lr_step;\n"
+                << "    if (st < 9223372036854775807LL) m->ctx->lr_step = st + 1;\n"
+                << "    const float lr_eff = lr * ns_lr_schedule(st);\n"
+                << "    ns_train_core(m->ctx, input, input_numel, labels, m->h_w, m->h_w, loss_out, lr_eff, 1);\n"
                 << "    return 0;\n"
                 << "}\n\n"
                 << "extern \"C\" int ns_objective_loss(ns_model* m, const float* input,\n"
@@ -1027,6 +1082,7 @@ std::string CodeGenerator::gen_cpu(const MLIRModule& module, const CodegenOption
         << "#include <cstddef>\n"
         << "#include <cmath>\n"
         << "#include <cstring>\n"
+        << "#include <cstdio>\n"
         << "#include <vector>\n"
         << "#include <random>\n"
         << "#include <algorithm>\n\n";
@@ -2049,6 +2105,7 @@ std::string CodeGenerator::gen_cpu(const MLIRModule& module, const CodegenOption
                     }
                 }
                 oss << "  std::mt19937 rng;\n"
+                    << "  int64_t lr_step = 0;   // LR schedule step counter (runtime wrapper)\n"
                     << "  ns_cpu_ctx() : rng(0x9E3779B9u) {}\n"
                     << "} ns_cpu_ctx;\n";
             } else {
@@ -2111,6 +2168,33 @@ std::string CodeGenerator::gen_cpu(const MLIRModule& module, const CodegenOption
         oss << "}\n\n";
         oss << "extern \"C\" void ns_free(ns_model* m) {\n";
         oss << "    if (!m) return; delete m->ctx; delete[] m->w; delete m;\n";
+        oss << "}\n\n";
+        oss << "// Persist / restore the weight blob. Format: 4-byte magic \"NSM1\",\n";
+        oss << "// size_t float count, then the raw weights (host-endian).\n";
+        oss << "extern \"C\" int ns_save_checkpoint(const ns_model* m, const char* path) {\n";
+        oss << "    if (!m || !m->w || !path) return -1;\n";
+        oss << "    FILE* fp = fopen(path, \"wb\");\n";
+        oss << "    if (!fp) return -1;\n";
+        oss << "    const unsigned magic = 0x4E534D31u; /* \"NSM1\" */\n";
+        oss << "    if (fwrite(&magic, sizeof(magic), 1, fp) != 1 ||\n";
+        oss << "        fwrite(&ns_weight_total, sizeof(ns_weight_total), 1, fp) != 1 ||\n";
+        oss << "        fwrite(m->w, sizeof(float), ns_weight_total, fp) != ns_weight_total) {\n";
+        oss << "        fclose(fp); return -1;\n";
+        oss << "    }\n";
+        oss << "    fclose(fp); return 0;\n";
+        oss << "}\n\n";
+        oss << "extern \"C\" int ns_load_checkpoint(ns_model* m, const char* path) {\n";
+        oss << "    if (!m || !m->w || !path) return -1;\n";
+        oss << "    FILE* fp = fopen(path, \"rb\");\n";
+        oss << "    if (!fp) return -1;\n";
+        oss << "    unsigned magic = 0; size_t n = 0;\n";
+        oss << "    if (fread(&magic, sizeof(magic), 1, fp) != 1 ||\n";
+        oss << "        fread(&n, sizeof(n), 1, fp) != 1 ||\n";
+        oss << "        magic != 0x4E534D31u || n != ns_weight_total ||\n";
+        oss << "        fread(m->w, sizeof(float), n, fp) != n) {\n";
+        oss << "        fclose(fp); return -1;\n";
+        oss << "    }\n";
+        oss << "    fclose(fp); return 0;\n";
         oss << "}\n";
 
         // ---- AOT training (network train() method present) ----
@@ -2119,11 +2203,15 @@ std::string CodeGenerator::gen_cpu(const MLIRModule& module, const CodegenOption
             const MLIRFunction& t = f;
             oss << "\n// ---- Training core (forward + backward + optimizer) ----\n";
             oss << emit_train_core(t, in_cols);
+            oss << "\n" << lr_schedule_source();
             oss << "\nextern \"C\" int ns_runtime_train_step(ns_model* m, const float* input,\n"
                 << "                                        const float* labels, size_t input_numel,\n"
                 << "                                        float* loss_out, float lr) {\n"
                 << "    if (!m || !m->w) return -1;\n"
-                << "    ns_train_core(m->ctx, input, input_numel, labels, m->w, m->w, loss_out, lr, 1);\n"
+                << "    int64_t st = m->ctx->lr_step;\n"
+                << "    if (st < 9223372036854775807LL) m->ctx->lr_step = st + 1;\n"
+                << "    const float lr_eff = lr * ns_lr_schedule(st);\n"
+                << "    ns_train_core(m->ctx, input, input_numel, labels, m->w, m->w, loss_out, lr_eff, 1);\n"
                 << "    return 0;\n"
                 << "}\n\n"
                 << "extern \"C\" int ns_objective_loss(ns_model* m, const float* input,\n"

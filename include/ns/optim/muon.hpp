@@ -80,6 +80,8 @@ public:
     // the 0-based step number before step_param sequence.
     void set_step(size_t s) { step_ = s; }
 
+    void set_lr(double lr) { p_.lr = lr; }
+
     const MuonParams& params() const { return p_; }
     size_t param_count() const { return params_.size(); }
     const MuonState& state(size_t i) const { return states_[i]; }

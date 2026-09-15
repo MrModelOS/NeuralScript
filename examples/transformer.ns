@@ -1,0 +1,77 @@
+// NeuralScript example: a minimal transformer trained end-to-end via AOT
+// reverse-mode, demonstrating the full v1.3 layer stack:
+//
+//   Embedding → Attention → LayerNorm → MLP (ReLU) → Dense → CE
+//
+// Build & run:
+//   ./build/nsc examples/transformer.ns --check         # shape check
+//   ./build/nsc examples/transformer.ns --mlir          # MLIR dump
+//   ./build/nsc examples/transformer.ns --cpp --runtime # self-contained CPU driver
+//   ./build/nsc examples/transformer.ns --cuda --runtime # CUDA runtime driver
+//
+// C-ABI training loop (after nsc --runtime):
+//   ns_model* m = ns_runtime_init(w.data(), w.size());
+//   for (int i = 0; i < steps; i++) {
+//       ns_runtime_train_step(m, xs, ys, seq_len, &loss, lr);
+//   }
+
+type T     = Dynamic   // flattened token-index vector (sequence length)
+type Vocab = 8         // small vocabulary for the toy task
+type D     = 16        // embedding / model dimension
+type H     = 4         // attention heads
+type FF    = 32        // feed-forward hidden dimension
+type C     = 8         // number of classes (== Vocab; copy-token task)
+
+// -- Task --
+// "Copy the class of the FIRST token" at every position in the sequence.
+// This requires attention: each position must attend to position 0 to read
+// the class id, then predict it through the classification head.
+//
+// Input format:  x[T]  – token indices (each an id in [0, Vocab))
+// Label format:  y[T, C] – one-hot class (same at every position)
+
+network Transformer {
+    input:  Tensor[T] float32
+    output: Tensor[T, C] float32
+
+    layer emb   = Embedding(vocab_size: Vocab, d_model: D)
+    layer attn  = Attention(d_model: D, num_heads: H)
+    layer ln    = LayerNorm()
+    layer mlp1  = Dense(in: D, out: FF, activation: ReLU)
+    layer mlp2  = Dense(in: FF, out: D, activation: Identity)
+    layer fc    = Dense(in: D, out: C,  activation: Identity)
+
+    forward(x) {
+        var h = x -> emb
+        var a = h -> attn
+        var n = a -> ln
+        var g = n -> mlp1 -> mlp2
+        return g -> fc
+    }
+
+    // AOT training step: full forward + reverse-mode through Attention,
+    // LayerNorm, Embedding, and MLP, ending in cross-entropy loss.
+    train(x: Tensor[T], labels: Tensor[T, C]) -> float32 {
+        grad {
+            var h      = x -> emb
+            var at     = h -> attn
+            var ln_    = at -> ln
+            var h1     = relu(ln_ @ mlp1)
+            var h2     = h1 @ mlp2
+            var preds  = h2 @ fc
+            var loss   = cross_entropy(preds, labels)
+        }
+        return loss
+    }
+}
+
+// The compiled driver (nsc --runtime) exports:
+//   ns_runtime_init         – create model with weight buffer
+//   ns_runtime_train_step   – forward + backward + optimizer (AdamW/Muon)
+//   ns_eval_infer           – forward-only inference
+//   ns_save_checkpoint      – persist weights to disk
+//   ns_load_checkpoint      – restore weights from disk
+//
+// LR schedule: the runtime wrapper applies the compiled-in schedule from
+// include/ns/optim/optim_params.hpp (default: constant; opt-in
+// cosine-with-warmup).

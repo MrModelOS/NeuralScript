@@ -202,6 +202,8 @@ static const char* kHostAbi[] = {
     "extern \"C\" int ns_objective_loss(ns_model*, const float*, const float*, size_t, float*);\n",
     "extern \"C\" int ns_eval_infer(ns_model*, const float*, float*, size_t);\n",
     "extern \"C\" int ns_model_get_weights(const ns_model*, float*, size_t);\n",
+    "extern \"C\" int ns_save_checkpoint(const ns_model*, const char*);\n",
+    "extern \"C\" int ns_load_checkpoint(ns_model*, const char*);\n",
     "extern \"C\" void ns_free(ns_model*);\n",
 };
 
@@ -247,19 +249,34 @@ static std::string xor_host_source() {
              "  int moved = 0;\n"
              "  for (size_t i = 0; i < nw; i++) if (wT[i] != w0[i]) moved++;\n"
              "  if (moved == 0) return fail(\"weights did not move\");\n"
-             "  int acc = 0;\n"
-             "  for (int p = 0; p < 4; p++) {\n"
-             "    float out[2];\n"
-             "    if (ns_eval_infer(m, xs[p], out, 2) != 0) return fail(\"eval_infer\");\n"
-             "    int pred = out[0] >= out[1] ? 0 : 1;\n"
-             "    int truth = ys[p][0] >= ys[p][1] ? 0 : 1;\n"
-             "    if (pred == truth) acc++;\n"
-             "  }\n"
-             "  if (acc != 4) return fail(\"accuracy\");\n"
-             "  std::printf(\"xor: loss0=%.4f lossT=%.5f acc=4/4\\n\", loss0, lossT);\n"
-             "  ns_free(m);\n"
-             "  return 0;\n"
-             "}\n";
+"  int acc = 0;\n"
+              "  for (int p = 0; p < 4; p++) {\n"
+              "    float out[2];\n"
+              "    if (ns_eval_infer(m, xs[p], out, 2) != 0) return fail(\"eval_infer\");\n"
+              "    int pred = out[0] >= out[1] ? 0 : 1;\n"
+              "    int truth = ys[p][0] >= ys[p][1] ? 0 : 1;\n"
+              "    if (pred == truth) acc++;\n"
+              "  }\n"
+              "  if (acc != 4) return fail(\"accuracy\");\n"
+              "  if (ns_save_checkpoint(m, \"/tmp/ns_cp_xor.bin\") != 0) return fail(\"save_ckpt\");\n"
+              "  ns_model* m2 = ns_runtime_init(w0.data(), nw);\n"   // untrained copy
+              "  if (!m2) return fail(\"init2\");\n"
+              "  if (ns_load_checkpoint(m2, \"/tmp/ns_cp_xor.bin\") != 0) return fail(\"load_ckpt\");\n"
+              "  { int acc2 = 0;\n"
+              "    for (int p = 0; p < 4; p++) {\n"
+              "      float out[2];\n"
+              "      if (ns_eval_infer(m2, xs[p], out, 2) != 0) return fail(\"eval_infer2\");\n"
+              "      int pred = out[0] >= out[1] ? 0 : 1;\n"
+              "      int truth = ys[p][0] >= ys[p][1] ? 0 : 1;\n"
+              "      if (pred == truth) acc2++;\n"
+              "    }\n"
+              "    if (acc2 != 4) return fail(\"ckpt_accuracy\"); }\n"
+              "  ns_free(m2);\n"
+              "  std::remove(\"/tmp/ns_cp_xor.bin\");\n"
+              "  std::printf(\"xor: loss0=%.4f lossT=%.5f acc=4/4\\n\", loss0, lossT);\n"
+              "  ns_free(m);\n"
+              "  return 0;\n"
+              "}\n";
         s = o.str();
     }
     return s;

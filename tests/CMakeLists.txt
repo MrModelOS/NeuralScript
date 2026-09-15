@@ -57,6 +57,11 @@ add_executable(test_optim test_optim.cpp)
 target_link_libraries(test_optim ns_core)
 add_test(NAME test_optim COMMAND test_optim)
 
+add_executable(test_lr_schedule test_lr_schedule.cpp)
+target_compile_definitions(test_lr_schedule PRIVATE NS_REPO_INCLUDE_DIR="${CMAKE_SOURCE_DIR}")
+target_link_libraries(test_lr_schedule ns_core)
+add_test(NAME test_lr_schedule COMMAND test_lr_schedule)
+
 add_executable(test_runtime test_runtime.cpp)
 target_link_libraries(test_runtime ns_core)
 target_compile_definitions(test_runtime PRIVATE

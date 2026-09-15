@@ -74,6 +74,15 @@ const ns_weight_layout* ns_model_layout(const ns_model* m);
 /* Free the model and its buffers. */
 void ns_free(ns_model* m);
 
+/* Persist the current weight blob to `path` (binary, "NSM1" magic + float
+   count + raw host-endian weights). Returns 0 on success, -1 on error. */
+int ns_save_checkpoint(const ns_model* m, const char* path);
+
+/* Restore weights from a checkpoint saved with ns_save_checkpoint. The
+   host-side copy is replaced; device weight state is re-synced on CUDA
+   backends. Returns 0 on success (including a missing/corrupt file -> -1). */
+int ns_load_checkpoint(ns_model* m, const char* path);
+
 /* ---- AOT training (present when the network defines a train() method) ----
  *
  * The generated training core shares the SAME weight blob as inference, so a

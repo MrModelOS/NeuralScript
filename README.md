@@ -77,6 +77,27 @@ gradient instructions, so they can be used in AOT training bodies:
   and the full stack trains end-to-end in `test_transformer_train`
   (emb→attn→ln→mlp→CE, copy-first-token, 16/16) — both CPU and CUDA.
 
+## v1.3: LR schedules, checkpoints, examples
+
+- **Compiled-in LR schedule** (`include/ns/optim/optim_params.hpp`): the
+  `ns_runtime_train_step` wrapper (CPU + CUDA) applies a schedule multiplier to
+  the caller's base `lr` before entering `ns_train_core`, so the decay logic
+  is baked into the AOT binary. Two schedules: `kConstant` (default, multiplier
+  always 1 — identical to legacy behavior) and `kCosineWithWarmup` (linear warmup
+  then half-cosine decay to `kLrMinFactor`). The library-side
+  `NumericTrainer::apply_step` scales the MuonOptimizer's `lr` by the same
+  `lr_scale()` at each step, keeping the reference and compiled paths in parity.
+  Unit-tested by `test_lr_schedule` (formula + `set_lr` round-trip).
+- **Checkpoint save/load** (`ns_save_checkpoint`, `ns_load_checkpoint`): emitted
+  in every self-contained runtime driver alongside `ns_free`. Format: 4-byte magic
+  `NSM1`, `size_t` float count, raw host-endian weights. CUDA load re-syncs the
+  device weight buffer via `cudaMemcpy`. Verified in `test_runtime` (CPU
+  round-trip) and in `test_cuda_codegen` (device re-sync through the CUDA
+  attention path).
+- **`examples/transformer.ns`**: a minimal copy-first-token transformer
+  (emb→attn→ln→mlp→CE, 2240 params) demonstrating the full v1.3 layer stack
+  and the `train()` method; usable with `nsc --cpp --runtime` or `--cuda --runtime`.
+
 Core tests: `test_transformer` (embedding→attention→layernorm vs a scalar
 reference), `test_datamove` (programmatic embedding→matmul→transpose→concat→
 reshape→layernorm), `test_dsl_datamove` (parser path for slice/index/scatter/
@@ -100,7 +121,7 @@ cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
 cmake --build build-asan -j && ctest --test-dir build-asan
 ```
 
-Installed (CPU) suite: 20 tests. Optional CUDA backend integration test —
+Installed (CPU) suite: 21 tests. Optional CUDA backend integration test —
 opt-in so plain `ctest` stays green on machines without a CUDA toolkit or GPU:
 
 ```sh
@@ -131,7 +152,9 @@ AOT-training loop on a CUDA-capable device and verifies weight writeback and
   LayerNorm → MLP 16→32→16 → linear 16×4, 2240 params): same first-token task,
   15000 steps at lr=0.007, loss ~1.384 → ~0.00000, 16/16 device accuracy,
   exercising `ns_layernorm_grad_kernel` together with the attention and MLP
-  backward paths.
+  backward paths. Also exercises the checkpoint round-trip: after training,
+  `ns_save_checkpoint` → reload into an untrained model → device eval confirms
+  accuracy.
 
 Without nvcc or a GPU the test self-skips (exit 77, reported as SKIPPED by
 CTest). GPU-heavy runs are separated into `.github/workflows/cuda.yml`
@@ -237,7 +260,7 @@ loss is the mean over the batch.
 | `src/optim`, `src/training` | Muon/AdamW reference optimizer, `NumericTrainer` |
 | `include/ns/optim/optim_params.hpp` | canonical optimizer hyperparameters (single source of truth) |
 | `include/ns/runtime/ns_runtime.h` | canonical C-ABI for hosts (training entry points) |
-| `tests/` | frontend + codegen + runtime + AOT-training integration tests (18) |
+| `tests/` | frontend + codegen + runtime + AOT-training integration tests (21) |
 
 ## License
 

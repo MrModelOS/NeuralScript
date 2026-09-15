@@ -423,10 +423,15 @@ void NumericTrainer::apply_step(MuonOptimizer& opt, size_t step_index) {
         }
         params_registered_ = true;
     }
+    // Mirror the AOT runtime wrapper: scale the base LR by the compiled-in
+    // schedule so the library training path matches the emitted driver.
+    double base = opt.params().lr;
+    opt.set_lr(base * optim::lr_scale((int64_t)step_index));
     opt.set_step(step_index);
     for (size_t i = 0; i < params_.size(); i++) {
         opt.step_param(i, params_[i].grad.data());
     }
+    opt.set_lr(base);
 }
 
 } // namespace ns
