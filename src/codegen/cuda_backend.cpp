@@ -220,6 +220,150 @@ extern "C" __global__ void ns_attention_core_kernel(
       Ob[i * D + d] = a;
     }
 }
+// Multi-head attention backward: one block per (batch, head). Grid = B*H blocks.
+// Each block recomputes the head-local forward (Q/K/V from x@W, scores, softmax)
+// and the head-local output, then produces its full contribution to every target:
+// dX is written head-disjoint (no atomics); the four DxD weight grads accumulate
+// with atomicAdd. `which` selects the single output the caller wants:
+// 0=dX, 1=dWq, 2=dWk, 3=dWv, 4=dWo. weight targets must be zeroed by the caller.
+// Shared memory layout (dynamic): sc[S*S], then 8 arrays of S*Dk each
+// (qh, kh, vh, dQ, dK, dV, oh, dPr).
+extern "C" __global__ void ns_attention_grad_kernel(
+    const float* __restrict__ dout, const float* __restrict__ x,
+    const float* __restrict__ Wq, const float* __restrict__ Wk,
+    const float* __restrict__ Wv, const float* __restrict__ Wo,
+    float* __restrict__ dX, float* __restrict__ dWq, float* __restrict__ dWk,
+    float* __restrict__ dWv, float* __restrict__ dWo,
+    int BS, int D, int H, int S, int which) {
+  extern __shared__ float sm[];          // padded by caller to S*S + 8*S*Dk
+  float* sc = sm;
+  float* qh = sc + S * S;
+  float* kh = qh + S * (D / H);
+  float* vh = kh + S * (D / H);
+  float* dQ = vh + S * (D / H);
+  float* dK = dQ + S * (D / H);
+  float* dV = dK + S * (D / H);
+  float* ohv = dV + S * (D / H);
+  float* dPr = ohv + S * (D / H);
+  int Dk = D / H;
+  float scale = 1.0f / sqrtf((float)Dk);
+  int b = blockIdx.x / H, h = blockIdx.x - b * H;
+  int h0 = h * Dk;
+  const float* xb = x + b * S * D;
+  const float* db = dout + b * S * D;
+  for (int t = threadIdx.x; t < S * Dk; t += blockDim.x) {
+    int i = t / Dk, d = t % Dk;
+    float aq = 0.f, ak = 0.f, av = 0.f;
+    for (int k = 0; k < D; k++) {
+      float xv = xb[i * D + k];
+      aq += xv * Wq[k * D + h0 + d];
+      ak += xv * Wk[k * D + h0 + d];
+      av += xv * Wv[k * D + h0 + d];
+    }
+    qh[t] = aq; kh[t] = ak; vh[t] = av;
+  }
+  __syncthreads();
+  for (int t = threadIdx.x; t < S * S; t += blockDim.x) {
+    int i = t / S, j = t - i * S;
+    float a = 0.f;
+    for (int d = 0; d < Dk; d++) a += qh[i * Dk + d] * kh[j * Dk + d];
+    sc[t] = a * scale;
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < S; i += blockDim.x) {
+    float mx = sc[i * S];
+    for (int j = 1; j < S; j++) mx = fmaxf(mx, sc[i * S + j]);
+    float s = 0.f;
+    for (int j = 0; j < S; j++) { sc[i * S + j] = expf(sc[i * S + j] - mx); s += sc[i * S + j]; }
+    for (int j = 0; j < S; j++) sc[i * S + j] /= s;
+  }
+  __syncthreads();
+  // head output oh and head output grad dPr = dout @ Wo^T
+  for (int t = threadIdx.x; t < S * Dk; t += blockDim.x) {
+    int i = t / Dk, d = t % Dk;
+    float a = 0.f;
+    for (int j = 0; j < S; j++) a += sc[i * S + j] * vh[j * Dk + d];
+    ohv[t] = a;
+    float b2 = 0.f;
+    for (int n = 0; n < D; n++) b2 += db[i * D + n] * Wo[(h0 + d) * D + n];
+    dPr[t] = b2;
+  }
+  __syncthreads();
+  // dV[j,d] = sum_i sc[i,j] * dPr[i,d]
+  for (int t = threadIdx.x; t < S * Dk; t += blockDim.x) {
+    int j = t / Dk, d = t % Dk;
+    float a = 0.f;
+    for (int i = 0; i < S; i++) a += sc[i * S + j] * dPr[i * Dk + d];
+    dV[t] = a;
+  }
+  __syncthreads();
+  // dp[i,j], then row-blend into ds (reuses sc)
+  for (int i = threadIdx.x; i < S; i += blockDim.x) {
+    float dot = 0.f;
+    float dp[128];
+    for (int j = 0; j < S; j++) {
+      float a = 0.f;
+      for (int d = 0; d < Dk; d++) a += vh[j * Dk + d] * dPr[i * Dk + d];
+      dp[j] = a;
+      dot += sc[i * S + j] * dp[j];
+    }
+    for (int j = 0; j < S; j++) sc[i * S + j] = sc[i * S + j] * (dp[j] - dot);
+  }
+  __syncthreads();
+  // dQ[i,d] = scale * sum_j ds[i,j] * kh[j,d];  dK[j,d] = scale * sum_i ds[i,j] * qh[i,d]
+  for (int t = threadIdx.x; t < S * Dk; t += blockDim.x) {
+    int i = t / Dk, d = t % Dk;
+    float aq = 0.f, ak = 0.f;
+    for (int j = 0; j < S; j++) {
+      float ds = sc[i * S + j];
+      aq += ds * kh[j * Dk + d];
+      ak += ds * qh[j * Dk + d];
+    }
+    dQ[t] = aq * scale;
+    dK[t] = ak * scale;
+  }
+  __syncthreads();
+  if (which == 0) {  // dX = dQ@Wq^T + dK@Wk^T + dV@Wv^T  (head-owned dims, disjoint)
+    for (int i = threadIdx.x; i < S; i += blockDim.x)
+      for (int d = 0; d < Dk; d++) {
+        float gq = 0.f, gk = 0.f, gv = 0.f;
+        for (int k = 0; k < D; k++) {
+          gq += dQ[i * Dk + d] * Wq[k * D + h0 + d];
+          gk += dK[i * Dk + d] * Wk[k * D + h0 + d];
+          gv += dV[i * Dk + d] * Wv[k * D + h0 + d];
+        }
+        dX[(b * S + i) * D + h0 + d] = gq + gk + gv;
+      }
+  } else if (which == 1) {  // dWq = x^T @ dQ
+    for (int k = 0; k < D; k++)
+      for (int n = h0; n < h0 + Dk; n++) {
+        float a = 0.f;
+        for (int i = 0; i < S; i++) a += xb[i * D + k] * dQ[i * Dk + (n - h0)];
+        atomicAdd(&dWq[k * D + n], a);
+      }
+  } else if (which == 2) {  // dWk = x^T @ dK
+    for (int k = 0; k < D; k++)
+      for (int n = h0; n < h0 + Dk; n++) {
+        float a = 0.f;
+        for (int i = 0; i < S; i++) a += xb[i * D + k] * dK[i * Dk + (n - h0)];
+        atomicAdd(&dWk[k * D + n], a);
+      }
+  } else if (which == 3) {  // dWv = x^T @ dV
+    for (int k = 0; k < D; k++)
+      for (int n = h0; n < h0 + Dk; n++) {
+        float a = 0.f;
+        for (int i = 0; i < S; i++) a += xb[i * D + k] * dV[i * Dk + (n - h0)];
+        atomicAdd(&dWv[k * D + n], a);
+      }
+  } else {  // dWo = oh^T @ dout
+    for (int k = h0; k < h0 + Dk; k++)
+      for (int n = 0; n < D; n++) {
+        float a = 0.f;
+        for (int i = 0; i < S; i++) a += ohv[i * Dk + (k - h0)] * db[i * D + n];
+        atomicAdd(&dWo[k * D + n], a);
+      }
+  }
+}
 // Mixture-of-experts router: one thread per token. Router logits = x @ Wg with
 // a softmax over experts; the top-1 expert per token is applied to x (its [D,D]
 // matrix lives at We + e*D*D) and the result is scaled by the routing weight.

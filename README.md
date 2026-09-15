@@ -67,13 +67,13 @@ gradient instructions, so they can be used in AOT training bodies:
   kernel recomputes the fused routing (softmax over the top-1 expert, gate-grad
   `p⊙(dp−Σp·dp)`, expert-grad `xᵀ⊗(p·d)`) — verified by `test_moe_train`
   (2-expert token→class, 16/16).
-- All three have CPU (`ns_*_grad`) and CUDA kernels (`ns_*_grad_kernel`) and
-  forward cases in both `ns_train_core` CPU and CUDA emit, so the same train
-  body compiles for either backend. The optimizer steps on the MoE gate and
-  expert weights separately (`moe_g_w`, `moe_e_w`).
-- Attention backprop (dQ/dK/dV + softmax-grad + dWq/dWk/dWv/dWo) is the last
-  remaining forward-only layer; it lands with the end-to-end transformer train
-  test (emb→attn→ln→mlp→CE).
+- All four have CPU (`ns_*_grad` / `ns_attention_bwd`) and CUDA kernels
+  (`ns_*_grad_kernel` / `ns_attention_grad_kernel`) and forward cases in both
+  `ns_train_core` CPU and CUDA emit, so the same train body compiles for either
+  backend. The optimizer steps on the MoE gate and expert weights separately
+  (`moe_g_w`, `moe_e_w`) and on the four attention projection matrices
+  (`attn_q_w`, `attn_k_w`, `attn_v_w`, `attn_o_w`). Attention is verified by
+  `test_attention_train` (copy-first-token over a 16-token sequence, 16/16).
 
 Core tests: `test_transformer` (embedding→attention→layernorm vs a scalar
 reference), `test_datamove` (programmatic embedding→matmul→transpose→concat→
@@ -98,7 +98,7 @@ cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
 cmake --build build-asan -j && ctest --test-dir build-asan
 ```
 
-Installed (CPU) suite: 18 tests. Optional CUDA backend integration test —
+Installed (CPU) suite: 19 tests. Optional CUDA backend integration test —
 opt-in so plain `ctest` stays green on machines without a CUDA toolkit or GPU:
 
 ```sh
@@ -106,8 +106,8 @@ cmake -S . -B build-cuda -DNS_ENABLE_CUDA=ON
 cmake --build build-cuda -j && ctest --test-dir build-cuda
 ```
 
-`test_cuda_codegen` compiles the emitted `.cu` with `nvcc`, then runs two
-AOT-training loops on a CUDA-capable device and verifies weight writeback and
+`test_cuda_codegen` compiles each emitted `.cu` with `nvcc`, then runs an
+AOT-training loop on a CUDA-capable device and verifies weight writeback and
 `ns_objective_loss`:
 
 - **AdamW path** — XOR MLP (2×16→16×2, weights have `min(r,c)=2 < 8` so the
@@ -120,6 +120,11 @@ AOT-training loops on a CUDA-capable device and verifies weight writeback and
   through the CPU reference so both implementations must agree qualitatively.
   GPU/CPU loss trajectories over a bounded window agree to ~1e-3; the fp
   summation order drifts weights by ~1 after 30k full-batch steps.
+- **Attention path** — ATTEND (embedding 8×16 → self-attention d=16, h=4 →
+  linear 16×4, all weights Muon): copy-first-token over a 16-token sequence
+  fed as a single input (S=N), 12000 steps at lr=0.01, loss
+  ~1.386 → ~0.00000, 16/16 device accuracy through `ns_attention_core_kernel`
+  + `ns_attention_grad_kernel`.
 
 Without nvcc or a GPU the test self-skips (exit 77, reported as SKIPPED by
 CTest). GPU-heavy runs are separated into `.github/workflows/cuda.yml`

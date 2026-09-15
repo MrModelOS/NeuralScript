@@ -118,6 +118,38 @@ network DROPOUTX {
 }
 )";
 
+// Multi-head attention AOT backprop on device: embedding -> self-attention ->
+// dense head. Task: output the class of the FIRST token at every position, so
+// the attention must aggregate information across the whole sequence. The full
+// sequence is fed as one input (S = N); the eval must therefore also run the
+// whole sequence through ns_eval_infer at once. Attention weights are 16x16
+// so they take the Muon path; the embedding is 8x16 -> Muon too.
+static const char* ATTEND = R"(
+type Bs = Dynamic
+network ATTEND {
+    input:  Tensor[Bs] float32
+    output: Tensor[Bs, 4] float32
+    layer emb  = Embedding(vocab_size: 8, d_model: 16)
+    layer attn = Attention(d_model: 16, heads: 4)
+    layer fc   = Dense(in: 16, out: 4, activation: Identity)
+    forward(x) {
+        var h = x -> emb
+        var a = h -> attn
+        var t = a -> fc
+        return t
+    }
+    train(x: Tensor[Bs], labels: Tensor[Bs, 4]) -> float32 {
+        grad {
+            var h     = x -> emb
+            var at    = h -> attn
+            var preds = at @ fc
+            var loss  = cross_entropy(preds, labels)
+        }
+        return loss
+    }
+}
+)";
+
 static int run_cmd(const std::string& cmd) {
     int rc = std::system(cmd.c_str());
     if (rc == -1) return -1;
@@ -287,6 +319,52 @@ static std::string dropout_host_source() {
              "  }\n"
              "  if (acc != 4) return fail(\"accuracy\");\n"
              "  std::printf(\"dropout: loss0=%.4f lossT=%.5f acc=4/4\\n\", loss0, lossT);\n"
+             "  ns_free(m);\n"
+             "  return 0;\n"
+             "}\n";
+        s = o.str();
+    }
+    return s;
+}
+
+static std::string attn_host_source() {
+    std::string s;
+    {
+        std::ostringstream o;
+        write_host_abi(o, /*use_cuda_runtime=*/true);
+        o << "int main() {\n"
+             "  int dev = 0;\n"
+             "  if (cudaGetDeviceCount(&dev) != cudaSuccess || dev <= 0) return 77;\n"
+             "  const int N = 16, C = 4, V = 8, nw = 8 * 16 + 4 * 16 * 16 + 16 * 4;\n"
+             "  std::vector<float> xs(N);\n"
+             "  std::vector<float> ys(N * C, 0.f);\n"
+             "  unsigned s = 99u;\n"
+             "  for (int i = 0; i < N; i++) { s = s * 1103515245u + 12345u; xs[i] = (float)((s >> 16) % V); }\n"
+             "  int cls0 = (int)xs[0] % C;\n"
+             "  for (int i = 0; i < N; i++) ys[i * C + cls0] = 1.f;\n"
+             "  std::vector<float> w(nw);\n"
+             "  s = 12345u;\n"
+             "  for (auto& v : w) { s = s * 1103515245u + 12345u; v = ((float)(s >> 16) / 65535.f - 0.5f) * 0.2f; }\n"
+             "  ns_model* m = ns_runtime_init(w.data(), nw);\n"
+             "  if (!m) return fail(\"init\");\n"
+             "  float loss0 = -1.f;\n"
+             "  if (ns_objective_loss(m, xs.data(), ys.data(), N, &loss0) != 0) return fail(\"objective(0)\");\n"
+             "  if (!(loss0 > 1.0f && loss0 < 2.0f)) return fail(\"loss0 sanity\");\n"
+             "  float lossT = loss0;\n"
+             "  for (int e = 0; e < 12000; e++) {\n"
+             "    if (ns_runtime_train_step(m, xs.data(), ys.data(), N, &lossT, 0.01f) != 0) return fail(\"train_step\");\n"
+             "  }\n"
+             "  if (!(lossT < 0.5f * loss0)) return fail(\"loss did not decrease\");\n"
+             "  std::vector<float> outs(N * C);\n"
+             "  if (ns_eval_infer(m, xs.data(), outs.data(), N) != 0) return fail(\"eval_infer\");\n"
+             "  int acc = 0;\n"
+             "  for (int i = 0; i < N; i++) {\n"
+             "    int pred = 0;\n"
+             "    for (int c = 1; c < C; c++) if (outs[i * C + c] > outs[i * C + pred]) pred = c;\n"
+             "    if (pred == cls0) acc++;\n"
+             "  }\n"
+             "  if (acc != N) return fail(\"accuracy\");\n"
+             "  std::printf(\"attn: loss0=%.4f lossT=%.5f acc=16/16\\n\", loss0, lossT);\n"
              "  ns_free(m);\n"
              "  return 0;\n"
              "}\n";
@@ -501,6 +579,60 @@ int main() {
         return 1;
     }
 
-    std::cout << "PASS: CUDA codegen (AdamW XOR + Muon MUONX + Dropout DROPOUTX) trained on device\n";
+    // ---- Net 4: ATTEND, Attention AOT backprop on device. ----
+    Lexer lexer4(ATTEND);
+    auto toks4 = lexer4.tokenize();
+    Parser parser4(toks4);
+    Program prog4 = parser4.parse_program();
+    ShapeChecker checker4;
+    checker4.check(prog4);
+    MLIRCompiler mlir4;
+    auto module4 = mlir4.compile(prog4);
+    FusionPass fuse4;
+    fuse4.run(module4);
+
+    CodegenOptions opts4;
+    opts4.backend = TargetBackend::CUDA;
+    opts4.emit_runtime_driver = true;
+    opts4.function_name = "ns_attend_forward";
+    std::string code4 = cg.generate(module4, opts4);
+    const std::string cu4 = "/tmp/ns_cuda_attn.cu";
+    {
+        std::ofstream of(cu4);
+        of << code4;
+    }
+    if (code4.find("ns_attention_core_kernel") == std::string::npos ||
+        code4.find("ns_attention_grad_kernel") == std::string::npos ||
+        code4.find("ns_embedding_kernel") == std::string::npos) {
+        std::cerr << "FAIL: emitted CUDA is missing attention backward kernel\n";
+        return 1;
+    }
+
+    if (run_cmd(nvcc + " -c -O2 -std=c++11 " + cu4 + " -o /tmp/ns_cuda_attn.o") != 0) {
+        std::cerr << "FAIL: nvcc rejected the attention CUDA source\n";
+        return 1;
+    }
+
+    const std::string host_attn = "/tmp/ns_cuda_attn_host.cpp";
+    {
+        std::ofstream hf(host_attn);
+        hf << attn_host_source();
+    }
+    std::string bin4 = "/tmp/ns_cuda_attn_run";
+    if (run_cmd(nvcc + " -O2 -std=c++11 " + cu4 + " " + host_attn + " -o " + bin4) != 0) {
+        std::cerr << "FAIL: nvcc attention host link failed\n";
+        return 1;
+    }
+    int rc4 = run_cmd(bin4);
+    if (rc4 == 77) {
+        std::cout << "SKIP: no CUDA-capable device present\n";
+        return 77;
+    }
+    if (rc4 != 0) {
+        std::cerr << "FAIL: CUDA ATTEND (Attention AOT) training run failed (exit " << rc4 << ")\n";
+        return 1;
+    }
+
+    std::cout << "PASS: CUDA codegen (AdamW XOR + Muon MUONX + Dropout DROPOUTX + Attention ATTEND) trained on device\n";
     return 0;
 }

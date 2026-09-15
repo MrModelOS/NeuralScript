@@ -1462,6 +1462,136 @@ std::string CodeGenerator::gen_cpu(const MLIRModule& module, const CodegenOption
         << "  memcpy(out, proj, BS*D*sizeof(float));\n"
         << "}\n\n";
 
+    oss << "// Multi-head attention backward: recompute Q/K/V and the per-head\n"
+        << "// softmax, then push the upstream dL/dout through O -> head-concat ->\n"
+        << "// softmax -> Q/K/V -> the four DxD projections.  The caller selects a\n"
+        << "// SINGLE target output (dX or one of dWq/dWk/dWv/dWo) by passing a\n"
+        << "// non-null pointer; the layer input gradient accumulates the gate + \n"
+        << "// expert paths in the recomputed stack.\n"
+        << "static void ns_attention_bwd(const float* dout, const float* x,\n"
+        << "                            const float* Wq, const float* Wk, const float* Wv, const float* Wo,\n"
+        << "                            float* dX, float* dWq, float* dWk, float* dWv, float* dWo,\n"
+        << "                            int64_t BS, int64_t D, int64_t H, int64_t S) {\n"
+        << "  if (D <= 0 || H <= 0 || S <= 0) return;\n"
+        << "  int64_t Dk = D / H;\n"
+        << "  float scale = 1.0f / sqrtf((float)Dk);\n"
+        << "  int64_t B = BS / S;\n"
+        << "  if (B <= 0) B = 1;\n"
+        << "  auto gemm = [](const float* A, const float* Bw, float* C,\n"
+        << "                  int64_t M, int64_t K, int64_t N) {\n"
+        << "    for (int64_t i = 0; i < M; i++)\n"
+        << "      for (int64_t j = 0; j < N; j++) {\n"
+        << "        float a = 0.f;\n"
+        << "        for (int64_t k = 0; k < K; k++) a += A[i*K+k]*Bw[k*N+j];\n"
+        << "        C[i*N+j] = a;\n"
+        << "      }\n"
+        << "  };\n"
+        << "  auto gtx = [](const float* A, const float* Bw, float* C,\n"
+        << "                int64_t M, int64_t K, int64_t N) {  // C = A^T @ Bw\n"
+        << "    for (int64_t k = 0; k < K; k++)\n"
+        << "      for (int64_t n = 0; n < N; n++) {\n"
+        << "        float a = 0.f;\n"
+        << "        for (int64_t i = 0; i < M; i++) a += A[i*K+k]*Bw[i*N+n];\n"
+        << "        C[k*N+n] = a;\n"
+        << "      }\n"
+        << "  };\n"
+        << "  auto gmt = [](const float* A, const float* Bw, float* C,\n"
+        << "                int64_t M, int64_t K, int64_t N) {  // C = A @ Bw^T\n"
+        << "    for (int64_t i = 0; i < M; i++)\n"
+        << "      for (int64_t j = 0; j < N; j++) {\n"
+        << "        float a = 0.f;\n"
+        << "        for (int64_t k = 0; k < K; k++) a += A[i*K+k]*Bw[j*K+k];\n"
+        << "        C[i*N+j] = a;\n"
+        << "      }\n"
+        << "  };\n"
+        << "  std::vector<float> Qq(BS*D), Kk(BS*D), Vv(BS*D);\n"
+        << "  std::vector<float> dQ2(BS*D), dK2(BS*D), dV2(BS*D), dPre(BS*D), oh(BS*D), sc((size_t)S*S);\n"
+        << "  gemm(x, Wq, Qq.data(), BS, D, D);\n"
+        << "  gemm(x, Wk, Kk.data(), BS, D, D);\n"
+        << "  gemm(x, Wv, Vv.data(), BS, D, D);\n"
+        << "  for (int64_t i = 0; i < BS; i++)\n"
+        << "    for (int64_t k = 0; k < D; k++) {\n"
+        << "      float a = 0.f;\n"
+        << "      for (int64_t n = 0; n < D; n++) a += dout[i*D+n] * Wo[k*D+n];\n"
+        << "      dPre[i*D+k] = a;\n"
+        << "    }\n"
+        << "  std::fill(dQ2.begin(), dQ2.end(), 0.f);\n"
+        << "  std::fill(dK2.begin(), dK2.end(), 0.f);\n"
+        << "  std::fill(dV2.begin(), dV2.end(), 0.f);\n"
+        << "  std::fill(oh.begin(), oh.end(), 0.f);\n"
+        << "  for (int64_t b = 0; b < B; b++) {\n"
+        << "    for (int64_t h = 0; h < H; h++) {\n"
+        << "      // scores + softmax\n"
+        << "      for (int64_t i = 0; i < S; i++) {\n"
+        << "        for (int64_t j = 0; j < S; j++) {\n"
+        << "          float a = 0.f;\n"
+        << "          for (int64_t d = 0; d < Dk; d++)\n"
+        << "            a += Qq[((b*S+i)*D)+h*Dk+d] * Kk[((b*S+j)*D)+h*Dk+d];\n"
+        << "          sc[i*S+j] = a * scale;\n"
+        << "        }\n"
+        << "        float mx = sc[i*S];\n"
+        << "        for (int64_t j = 1; j < S; j++) mx = std::max(mx, sc[i*S+j]);\n"
+        << "        float s = 0.f;\n"
+        << "        for (int64_t j = 0; j < S; j++) { sc[i*S+j] = expf(sc[i*S+j]-mx); s += sc[i*S+j]; }\n"
+        << "        for (int64_t j = 0; j < S; j++) sc[i*S+j] /= s;\n"
+        << "      }\n"
+        << "      // out_head (for dWo) and dP\n"
+        << "      for (int64_t i = 0; i < S; i++)\n"
+        << "        for (int64_t d = 0; d < Dk; d++) {\n"
+        << "          float a = 0.f;\n"
+        << "          for (int64_t j = 0; j < S; j++)\n"
+        << "            a += sc[i*S+j] * Vv[((b*S+j)*D)+h*Dk+d];\n"
+        << "          oh[((b*S+i)*D)+h*Dk+d] = a;\n"
+        << "        }\n"
+        << "      // V grad and P grad (dPre is the head output grad)\n"
+        << "      for (int64_t j = 0; j < S; j++)\n"
+        << "        for (int64_t d = 0; d < Dk; d++) {\n"
+        << "          float a = 0.f;\n"
+        << "          for (int64_t i = 0; i < S; i++)\n"
+        << "            a += sc[i*S+j] * dPre[((b*S+i)*D)+h*Dk+d];\n"
+        << "          dV2[((b*S+j)*D)+h*Dk+d] += a;\n"
+        << "        }\n"
+        << "      std::vector<float> dp((size_t)S*S), ds((size_t)S*S);\n"
+        << "      for (int64_t i = 0; i < S; i++) {\n"
+        << "        for (int64_t j = 0; j < S; j++) {\n"
+        << "          float a = 0.f;\n"
+        << "          for (int64_t d = 0; d < Dk; d++)\n"
+        << "            a += Vv[((b*S+j)*D)+h*Dk+d] * dPre[((b*S+i)*D)+h*Dk+d];\n"
+        << "          dp[i*S+j] = a;\n"
+        << "        }\n"
+        << "        float dot = 0.f;\n"
+        << "        for (int64_t j = 0; j < S; j++) dot += sc[i*S+j]*dp[i*S+j];\n"
+        << "        for (int64_t j = 0; j < S; j++) ds[i*S+j] = sc[i*S+j]*(dp[i*S+j]-dot);\n"
+        << "      }\n"
+        << "      // Q, K grads\n"
+        << "      for (int64_t i = 0; i < S; i++)\n"
+        << "        for (int64_t d = 0; d < Dk; d++) {\n"
+        << "          float a = 0.f;\n"
+        << "          for (int64_t j = 0; j < S; j++) a += ds[i*S+j]*Kk[((b*S+j)*D)+h*Dk+d];\n"
+        << "          dQ2[((b*S+i)*D)+h*Dk+d] += a * scale;\n"
+        << "        }\n"
+        << "      for (int64_t j = 0; j < S; j++)\n"
+        << "        for (int64_t d = 0; d < Dk; d++) {\n"
+        << "          float a = 0.f;\n"
+        << "          for (int64_t i = 0; i < S; i++) a += ds[i*S+j]*Qq[((b*S+i)*D)+h*Dk+d];\n"
+        << "          dK2[((b*S+j)*D)+h*Dk+d] += a * scale;\n"
+        << "        }\n"
+        << "    }\n"
+        << "  }\n"
+        << "  // projection grads and input grad\n"
+        << "  if (dWq) { for (int64_t n = 0; n < D*D; n++) dWq[n] = 0.f; gtx(x, dQ2.data(), dWq, BS, D, D); }\n"
+        << "  if (dWk) { for (int64_t n = 0; n < D*D; n++) dWk[n] = 0.f; gtx(x, dK2.data(), dWk, BS, D, D); }\n"
+        << "  if (dWv) { for (int64_t n = 0; n < D*D; n++) dWv[n] = 0.f; gtx(x, dV2.data(), dWv, BS, D, D); }\n"
+        << "  if (dWo) { for (int64_t n = 0; n < D*D; n++) dWo[n] = 0.f; gtx(oh.data(), dout, dWo, BS, D, D); }\n"
+        << "  if (dX) {\n"
+        << "    std::vector<float> gq(BS*D), gk(BS*D), gv(BS*D);\n"
+        << "    gmt(dQ2.data(), Wq, gq.data(), BS, D, D);  // dQ2 @ Wq^T\n"
+        << "    gmt(dK2.data(), Wk, gk.data(), BS, D, D);\n"
+        << "    gmt(dV2.data(), Wv, gv.data(), BS, D, D);\n"
+        << "    for (int64_t i = 0; i < BS*D; i++) dX[i] = gq[i] + gk[i] + gv[i];\n"
+        << "  }\n"
+        << "}\n\n";
+
     oss << "// MIXTURE-OF-EXPERTS (fused router + top-1 dispatch + weighted combine).\n"
         << "// x[M,D]  Wg[D,E]  We[E,D,D]  →  out[M,D]\n"
         << "// Router logits = x @ Wg, softmax over experts, per token the top-1\n"
@@ -2190,6 +2320,24 @@ std::string CodeGenerator::emit_train_core(const MLIRFunction& tfn, int64_t in_c
                             ", buf_" + id + ".data(), M, " + to_string(D) + ", " + to_string(E) + "); }\n";
                 break;
             }
+            case MLIROp::LAYER_ATTENTION: {
+                string x = instr.operands.size() > 0 ? instr.operands[0] : "";
+                string Wq = instr.operands.size() > 1 ? instr.operands[1] : "";
+                string Wk = instr.operands.size() > 2 ? instr.operands[2] : "";
+                string Wv = instr.operands.size() > 3 ? instr.operands[3] : "";
+                string Wo = instr.operands.size() > 4 ? instr.operands[4] : "";
+                int64_t D = instr.int_attr > 0 ? instr.int_attr : 1;
+                int64_t H = instr.attribute.empty() ? 1 : std::atol(instr.attribute.c_str());
+                fwd_body += "  { int64_t BS = (int64_t)(" + numel_of(x) + ") / " + to_string(D) + ";\n";
+                fwd_body += "    int64_t S = BS;\n";
+                fwd_body += "    std::vector<float> q_b(BS*" + to_string(D) + "), k_b(BS*" + to_string(D) + "), v_b(BS*" + to_string(D) + "), proj_b(BS*" + to_string(D) + "), sc_b(S*S);\n";
+                fwd_body += "    buf_" + id + ".resize((size_t)(BS*" + to_string(D) + "));\n";
+                fwd_body += "    ns_attention_fwd(" + src_of(x) + ", " + src_of(Wq) + ", " + src_of(Wk) +
+                            ", " + src_of(Wv) + ", " + src_of(Wo) + ",\n";
+                fwd_body += "        q_b.data(), k_b.data(), v_b.data(), sc_b.data(), proj_b.data(), buf_" + id + ".data(),\n";
+                fwd_body += "        BS, " + to_string(D) + ", " + to_string(H) + ", S); }\n";
+                break;
+            }
             case MLIROp::LAYERNORM: case MLIROp::SOFTMAX: {
                 string in = instr.operands.size() > 0 ? instr.operands[0] : "";
                 int64_t last = train_row_dims(in);
@@ -2320,6 +2468,41 @@ std::string CodeGenerator::emit_train_core(const MLIRFunction& tfn, int64_t in_c
                 train_body += "    buf_" + id + ".resize((size_t)(" + to_string(E) + " * " + to_string(D) + " * " + to_string(D) + "));\n";
                 train_body += "    ns_moe_grad_we(buf_" + dout + ".data(), " + src_of(xo) + ", " + src_of(Wg) +
                               ", " + src_of(We) + ", buf_" + id + ".data(), M, " + to_string(D) + ", " + to_string(E) + "); }\n";
+                break;
+            }
+            case MLIROp::ATTENTION_GRAD_X:
+            case MLIROp::ATTENTION_GRAD_WQ:
+            case MLIROp::ATTENTION_GRAD_WK:
+            case MLIROp::ATTENTION_GRAD_WV:
+            case MLIROp::ATTENTION_GRAD_WO: {
+                string dout = instr.operands.size() > 0 ? instr.operands[0] : "";
+                string xo = instr.operands.size() > 1 ? instr.operands[1] : "";
+                string Wq = instr.operands.size() > 2 ? instr.operands[2] : "";
+                string Wk = instr.operands.size() > 3 ? instr.operands[3] : "";
+                string Wv = instr.operands.size() > 4 ? instr.operands[4] : "";
+                string Wo = instr.operands.size() > 5 ? instr.operands[5] : "";
+                int64_t D = instr.int_attr > 0 ? instr.int_attr : 1;
+                int64_t H = instr.attribute.empty() ? 1 : std::atol(instr.attribute.c_str());
+                int64_t DD = D * D;
+                string nele = (instr.op == MLIROp::ATTENTION_GRAD_X)
+                                  ? ("(int64_t)(buf_" + dout + ".size())") : to_string(DD);
+                string tgt =
+                    (instr.op == MLIROp::ATTENTION_GRAD_X) ? ("buf_" + id + ".data()") : ("buf_" + id + ".data()");
+                train_body += "  { int64_t BS = (int64_t)(buf_" + dout + ".size()) / " + to_string(D) + ";\n";
+                train_body += "    buf_" + id + ".resize((size_t)(" + nele + "));\n";
+                train_body += "    ns_attention_bwd(buf_" + dout + ".data(), " + src_of(xo) + ", " + src_of(Wq) +
+                              ", " + src_of(Wk) + ", " + src_of(Wv) + ", " + src_of(Wo) + ",\n";
+                if (instr.op == MLIROp::ATTENTION_GRAD_X)
+                    train_body += "        " + tgt + ", nullptr, nullptr, nullptr, nullptr,\n";
+                else if (instr.op == MLIROp::ATTENTION_GRAD_WQ)
+                    train_body += "        nullptr, " + tgt + ", nullptr, nullptr, nullptr,\n";
+                else if (instr.op == MLIROp::ATTENTION_GRAD_WK)
+                    train_body += "        nullptr, nullptr, " + tgt + ", nullptr, nullptr,\n";
+                else if (instr.op == MLIROp::ATTENTION_GRAD_WV)
+                    train_body += "        nullptr, nullptr, nullptr, " + tgt + ", nullptr,\n";
+                else
+                    train_body += "        nullptr, nullptr, nullptr, nullptr, " + tgt + ",\n";
+                train_body += "        BS, " + to_string(D) + ", " + to_string(H) + ", BS); }\n";
                 break;
             }
             case MLIROp::LAYERNORM_GRAD: {
@@ -2589,6 +2772,35 @@ std::string CodeGenerator::emit_train_core_cuda(const MLIRFunction& tfn,
                     + "M, " + to_string(D) + ", " + to_string(E) + ");\n";
                 break;
             }
+            case MLIROp::LAYER_ATTENTION: {
+                string x = instr.operands.size() > 0 ? instr.operands[0] : "";
+                string Wq = instr.operands.size() > 1 ? instr.operands[1] : "";
+                string Wk = instr.operands.size() > 2 ? instr.operands[2] : "";
+                string Wv = instr.operands.size() > 3 ? instr.operands[3] : "";
+                string Wo = instr.operands.size() > 4 ? instr.operands[4] : "";
+                int64_t D = instr.int_attr > 0 ? instr.int_attr : 1;
+                int64_t H = instr.attribute.empty() ? 1 : std::atol(instr.attribute.c_str());
+                fwd_text += "  if (ns_cu_reserve(&ctx->d_" + id + ", &ctx->d_" + id + "_cap, (size_t)M * "
+                    + to_string(D) + " * sizeof(float), 0)) return;\n";
+                fwd_text += "  { float* qs = 0; float* ks = 0; float* vs = 0; float* cs = 0;\n";
+                fwd_text += "    if (cudaMalloc(&qs, (size_t)M * " + to_string(D) + " * sizeof(float)) ||\n";
+                fwd_text += "        cudaMalloc(&ks, (size_t)M * " + to_string(D) + " * sizeof(float)) ||\n";
+                fwd_text += "        cudaMalloc(&vs, (size_t)M * " + to_string(D) + " * sizeof(float)) ||\n";
+                fwd_text += "        cudaMalloc(&cs, (size_t)M * " + to_string(D) + " * sizeof(float))) return;\n";
+                fwd_text += "    NS_LAUNCH_BLOCKS(ns_gemm_kernel, ((M + 15) / 16) * ((" + to_string(D) + " + 15) / 16), "
+                    + bufv(x) + ", " + bufv(Wq) + ", qs, M, " + to_string(D) + ", " + to_string(D) + ");\n";
+                fwd_text += "    NS_LAUNCH_BLOCKS(ns_gemm_kernel, ((M + 15) / 16) * ((" + to_string(D) + " + 15) / 16), "
+                    + bufv(x) + ", " + bufv(Wk) + ", ks, M, " + to_string(D) + ", " + to_string(D) + ");\n";
+                fwd_text += "    NS_LAUNCH_BLOCKS(ns_gemm_kernel, ((M + 15) / 16) * ((" + to_string(D) + " + 15) / 16), "
+                    + bufv(x) + ", " + bufv(Wv) + ", vs, M, " + to_string(D) + ", " + to_string(D) + ");\n";
+                fwd_text += "    ns_attention_core_kernel<<<" + to_string(H) + ", 256, (size_t)M * M * sizeof(float)>>>"
+                    + "(qs, ks, vs, cs, M, " + to_string(D) + ", " + to_string(H)
+                    + ", 1.0f / sqrtf((float)(" + to_string(D) + " / " + to_string(H) + ")));\n";
+                fwd_text += "    NS_LAUNCH_BLOCKS(ns_gemm_kernel, ((M + 15) / 16) * ((" + to_string(D) + " + 15) / 16), "
+                    + "cs, " + bufv(Wo) + ", ctx->d_" + id + ", M, " + to_string(D) + ", " + to_string(D) + ");\n";
+                fwd_text += "    cudaFree(qs); cudaFree(ks); cudaFree(vs); cudaFree(cs); }\n";
+                break;
+            }
             case MLIROp::LAYERNORM: case MLIROp::SOFTMAX: {
                 string in = instr.operands.size() > 0 ? instr.operands[0] : "";
                 int64_t Ns = row_dims(in);
@@ -2738,6 +2950,45 @@ std::string CodeGenerator::emit_train_core_cuda(const MLIRFunction& tfn,
                 train_text += "  NS_LAUNCH_BLOCKS(ns_moe_grad_we_kernel, M, "
                     + bufv(dout) + ", " + bufv(xo) + ", " + bufv(Wg) + ", " + bufv(We)
                     + ", ctx->d_" + id + ", M, " + to_string(D) + ", " + to_string(E) + ");\n";
+                break;
+            }
+            case MLIROp::ATTENTION_GRAD_X:
+            case MLIROp::ATTENTION_GRAD_WQ:
+            case MLIROp::ATTENTION_GRAD_WK:
+            case MLIROp::ATTENTION_GRAD_WV:
+            case MLIROp::ATTENTION_GRAD_WO: {
+                string dout = instr.operands.size() > 0 ? instr.operands[0] : "";
+                string xo = instr.operands.size() > 1 ? instr.operands[1] : "";
+                string Wq = instr.operands.size() > 2 ? instr.operands[2] : "";
+                string Wk = instr.operands.size() > 3 ? instr.operands[3] : "";
+                string Wv = instr.operands.size() > 4 ? instr.operands[4] : "";
+                string Wo = instr.operands.size() > 5 ? instr.operands[5] : "";
+                int64_t D = instr.int_attr > 0 ? instr.int_attr : 1;
+                int64_t H = instr.attribute.empty() ? 1 : std::atol(instr.attribute.c_str());
+                string DD2 = to_string(D) + " * " + to_string(D);
+                bool is_x = (instr.op == MLIROp::ATTENTION_GRAD_X);
+                int which = is_x ? 0 : (instr.op == MLIROp::ATTENTION_GRAD_WQ ? 1
+                    : (instr.op == MLIROp::ATTENTION_GRAD_WK ? 2
+                       : (instr.op == MLIROp::ATTENTION_GRAD_WV ? 3 : 4)));
+                if (is_x)
+                    train_text += "  if (ns_cu_reserve(&ctx->d_" + id + ", &ctx->d_" + id + "_cap, (size_t)M * "
+                        + to_string(D) + " * sizeof(float), 0)) return;\n";
+                else
+                    train_text += "  if (ns_cu_reserve(&ctx->d_" + id + ", &ctx->d_" + id + "_cap, (size_t)("
+                        + DD2 + ") * sizeof(float), 0)) return;\n";
+                if (!is_x)
+                    train_text += "  NS_LAUNCH1(ns_fill_kernel, " + DD2 + ", ctx->d_" + id + ", " + DD2 + ", 0.0f);\n";
+                train_text += "  { size_t sh = (size_t)M * M * sizeof(float) + 8 * (size_t)M * "
+                    + to_string(D / H) + " * sizeof(float);\n";
+                train_text += "  ns_attention_grad_kernel<<<" + to_string(H) + ", 256, sh>>>"
+                    + "(" + bufv(dout) + ", " + bufv(xo) + ", " + bufv(Wq) + ", " + bufv(Wk)
+                    + ", " + bufv(Wv) + ", " + bufv(Wo) + ", "
+                    + (is_x ? "ctx->d_" + id : "0") + ", "
+                    + (which == 1 ? ("ctx->d_" + id) : "0") + ", "
+                    + (which == 2 ? ("ctx->d_" + id) : "0") + ", "
+                    + (which == 3 ? ("ctx->d_" + id) : "0") + ", "
+                    + (which == 4 ? ("ctx->d_" + id) : "0") + ", M, "
+                    + to_string(D) + ", " + to_string(H) + ", M, " + to_string(which) + "); }\n";
                 break;
             }
             case MLIROp::LAYERNORM_GRAD: {

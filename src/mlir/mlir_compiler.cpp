@@ -392,6 +392,32 @@ void MLIRCompiler::compile_stmt(Stmt* stmt, MLIRFunction& fn) {
                         g[i.operands[2]] = me.result_id;
                         break;
                     }
+                    case MLIROp::LAYER_ATTENTION: {
+                        auto cit = g.find(i.result_id);
+                        if (cit == g.end() || i.operands.size() < 5) break;
+                        std::string H = i.attribute.empty() ? "1" : i.attribute;
+                        std::string D = std::to_string(i.int_attr);
+                        // Grad-to-input: full recompute of the attention stack.
+                        auto ax = MLIRInstr(MLIROp::ATTENTION_GRAD_X, new_temp("g"));
+                        ax.operands = {cit->second, i.operands[0], i.operands[1],
+                                       i.operands[2], i.operands[3], i.operands[4]};
+                        ax.attribute = H; ax.int_attr = i.int_attr;
+                        ax.comment = "dx(attention)";
+                        fn.instructions.push_back(ax);
+                        g[i.operands[0]] = ax.result_id;
+                        // Projection-weight grads (q,k,v,o); each op recomputes
+                        // the stack so it needs no saved forward intermediates.
+                        MLIROp wops[4] = {MLIROp::ATTENTION_GRAD_WQ, MLIROp::ATTENTION_GRAD_WK,
+                                          MLIROp::ATTENTION_GRAD_WV, MLIROp::ATTENTION_GRAD_WO};
+                        for (int q2 = 0; q2 < 4; q2++) {
+                            auto aq = MLIRInstr(wops[q2], new_temp("g"));
+                            aq.operands = ax.operands;
+                            aq.attribute = H; aq.int_attr = i.int_attr;
+                            fn.instructions.push_back(aq);
+                            g[i.operands[1 + q2]] = aq.result_id;
+                        }
+                        break;
+                    }
                     default:
                         break;
                 }
@@ -802,10 +828,6 @@ void MLIRCompiler::apply_pipeline_stage(const std::string& wname, MLIRValue& in,
             return;
         }
         if (ty == "Attention" || ty == "MultiHeadAttention") {
-            if (is_train_fn)
-                throw std::runtime_error(
-                    "AOT backprop through Attention is not implemented yet; "
-                    "use the layer in forward() only");
             if (miter->second.weight_ids.size() < 4)
                 throw std::runtime_error(
                     "Attention layer '" + wname +
@@ -918,6 +940,11 @@ std::string MLIRCompiler::dump(MLIRModule& module) {
                 case MLIROp::MOE_GRAD_X: oss << "ns.grad.moe.x"; break;
                 case MLIROp::MOE_GRAD_WG: oss << "ns.grad.moe.wg"; break;
                 case MLIROp::MOE_GRAD_WE: oss << "ns.grad.moe.we"; break;
+                case MLIROp::ATTENTION_GRAD_X: oss << "ns.grad.attention.x"; break;
+                case MLIROp::ATTENTION_GRAD_WQ: oss << "ns.grad.attention.wq"; break;
+                case MLIROp::ATTENTION_GRAD_WK: oss << "ns.grad.attention.wk"; break;
+                case MLIROp::ATTENTION_GRAD_WV: oss << "ns.grad.attention.wv"; break;
+                case MLIROp::ATTENTION_GRAD_WO: oss << "ns.grad.attention.wo"; break;
                 case MLIROp::MATMUL_GRAD_A: oss << "ns.grad.matmul.a"; break;
                 case MLIROp::MATMUL_GRAD_W: oss << "ns.grad.matmul.w"; break;
                 case MLIROp::ACTIVATION_GRAD: oss << "ns.grad.activation"; break;

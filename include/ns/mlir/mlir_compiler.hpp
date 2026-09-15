@@ -67,6 +67,14 @@ enum class MLIROp {
     MOE_GRAD_WG,
     MOE_GRAD_WE,
 
+    // Multi-head attention backward: recompute Q/K/V + per-head softmax;
+    // one op per output (grad-to-input and four projection weights)
+    ATTENTION_GRAD_X,
+    ATTENTION_GRAD_WQ,
+    ATTENTION_GRAD_WK,
+    ATTENTION_GRAD_WV,
+    ATTENTION_GRAD_WO,
+
     // Storage
     ALLOC_BUFFER,      // allocate GPU buffer
     FREE_BUFFER,       // free GPU buffer
