@@ -808,6 +808,11 @@ static int ns_cu_reserve(float** pp, size_t* pc, size_t bytes, int zero) {
   }
   return 0;
 }
+)CUDA";
+
+// The byte-mask allocator is only used by MoE models (expert liveness mask),
+// so it is emitted on demand to keep non-MoE units warning-free.
+static const char kRuntimeUtilsU8[] = R"CUDA(
 static int ns_cu_reserve_u8(uint8_t** pp, size_t* pc, size_t bytes, int zero) {
   if (!*pp || *pc < bytes) {
     if (*pp) cudaFree(*pp);
@@ -824,6 +829,7 @@ std::string device_helpers_source()  { return std::string(kLaunchMacros) + kDevi
 std::string forward_kernels_source() { return kForwardKernels; }
 std::string train_kernels_source()   { return kTrainKernels; }
 std::string runtime_utils_source()   { return kRuntimeUtils; }
+std::string runtime_utils_u8_source(){ return kRuntimeUtilsU8; }
 
 } // namespace cuda
 } // namespace ns

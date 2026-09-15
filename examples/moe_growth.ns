@@ -1,0 +1,69 @@
+// NeuralScript example: an FFN Mixture-of-Experts classifier with DYNAMIC
+// expert lifecycle, demonstrating the v1.3 MoE layer:
+//
+//   Dense → MoE (FFN experts, capacity 4, only 1 alive at init) → Dense → CE
+//
+// Build & run:
+//   ./build/nsc examples/moe_growth.ns --check         # shape check
+//   ./build/nsc examples/moe_growth.ns --mlir          # MLIR dump
+//   ./build/nsc examples/moe_growth.ns --cpp --runtime # self-contained CPU driver
+//   ./build/nsc examples/moe_growth.ns --cuda --runtime # CUDA runtime driver
+//
+// The MoE layer is compiled with capacity 4 but only the first expert alive:
+//   MoE(d_model: D, num_experts: 4, initial_experts: 1, ffn_dim: 4*D)
+// Experts are FFN blocks (D -> ffn_dim -> D, GELU). The router softmax runs
+// over LIVE experts only, so killing/birthing experts renormalizes routing.
+//
+// Training + lifecycle loop (after nsc --runtime):
+//   ns_model* m  = ns_runtime_init(w.data(), w.size());
+//   ns_expert_count(m)                 // == 1 right after init (K0)
+//   for (...) ns_runtime_train_step(m, xs, ys, n, &loss, lr);
+//   ns_expert_birth(m, 3);             // 1 -> 4: copy+noise from a live expert
+//   ns_expert_merge(m, 0, 1);          // average experts 0,1 into 0; retire 1
+//   ns_expert_kill(m, 3);              // retire expert 3 (optional)
+//   ns_save_checkpoint(m, "moe.nsm2"); // weights + liveness mask
+//   ns_load_checkpoint(m, "moe.nsm2"); // restores mask + weights (NSM2)
+//
+// One MoE layer per model is supported.
+
+type B    = Dynamic   // flattened token-index vector (batch)
+type V    = 16        // vocabulary size (toy task)
+type D    = 8         // model dimension
+type C    = 2         // number of classes (tokens [0,V/2) -> 0, [V/2,V) -> 1)
+
+network MoEGrowth {
+    input:  Tensor[B] float32
+    output: Tensor[B, C] float32
+
+    layer emb = Embedding(vocab_size: V, d_model: D)
+    layer moe = MoE(d_model: D, num_experts: 4, initial_experts: 1, ffn_dim: 32)
+    layer fc  = Dense(in: D, out: C, activation: Identity)
+
+    forward(x) {
+        var h = x -> emb
+        var m = h -> moe
+        return m -> fc
+    }
+
+    // AOT training step: reverse-mode through Embedding + FFN MoE.
+    train(x: Tensor[B], labels: Tensor[B, C]) -> float32 {
+        grad {
+            var h      = x -> emb
+            var moe_o  = h -> moe
+            var preds  = moe_o @ fc
+            var loss   = cross_entropy(preds, labels)
+        }
+        return loss
+    }
+}
+
+// The compiled driver (nsc --runtime) exports:
+//   ns_runtime_init       – create model with weight buffer
+//   ns_runtime_train_step – forward + backward + optimizer (AdamW/Muon)
+//   ns_eval_infer         – forward-only inference
+//   ns_expert_count/birth/merge/kill – dynamic expert lifecycle (MoE only)
+//   ns_save_checkpoint    – persist weights + liveness mask (NSM2)
+//   ns_load_checkpoint    – restore weights + mask from disk
+//
+// Weight blob layout: emb [V*D] | moe_g_w [D*E] | moe_e1_w [E*D*ffn] |
+//                       moe_e2_w [E*ffn*D] | fc [D*C].

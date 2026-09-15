@@ -13,6 +13,7 @@ namespace cuda {
     std::string forward_kernels_source();  // tiled GEMM, act, copy, fill, binop, ln, softmax
     std::string train_kernels_source();    // grad + AdamW/Muon/orthonom kernels
     std::string runtime_utils_source();    // canonical buffers + ns_cu_reserve
+    std::string runtime_utils_u8_source(); // byte allocator (MoE liveness, opt-in)
 } // namespace cuda
 
 enum class TargetBackend {

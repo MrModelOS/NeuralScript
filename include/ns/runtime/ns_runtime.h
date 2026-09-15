@@ -11,9 +11,9 @@ extern "C" {
  * sources are produced by the matching compiler release.
  */
 #define NS_RUNTIME_VERSION_MAJOR 1
-#define NS_RUNTIME_VERSION_MINOR 1
+#define NS_RUNTIME_VERSION_MINOR 2
 #define NS_RUNTIME_VERSION_PATCH 0
-#define NS_RUNTIME_VERSION "1.1.0"
+#define NS_RUNTIME_VERSION "1.2.0"
 
 /* NeuralScript AOT runtime C-ABI.
  *

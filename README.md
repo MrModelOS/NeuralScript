@@ -144,6 +144,8 @@ live-expert set at runtime, all over a static AOT graph:
   merge/kill, NSM2 round-trip, NSM1 fallback), `test_moe_train`
   (16/16 token→class via AOT backprop through the FFN MoE), and the MOEX net
   in `test_cuda_codegen` (MoE training + lifecycle + checkpoint on device).
+  `examples/moe_growth.ns` walks through the full lifecycle flow with
+  `nsc --runtime` on either backend.
 
 ## Build
 

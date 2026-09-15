@@ -415,6 +415,8 @@ std::string CodeGenerator::gen_cuda(const MLIRModule& module, const CodegenOptio
 
     // ---- Runtime utilities: canonical buffers + lazy device allocator. ----
     oss << cuda::runtime_utils_source();
+    if (moe_E > 0)
+        oss << cuda::runtime_utils_u8_source();
 
     // ---- Per-model device context (weights + scratch + optimizer state).
     //      Every allocation is owned by the model and released in the context
